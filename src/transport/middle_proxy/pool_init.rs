@@ -112,7 +112,7 @@ impl MePool {
                         continue;
                     }
                     let target_writers =
-                        pool.required_writers_for_dc_with_floor_mode(addrs.len(), false);
+                        pool.required_writers_for_dc_with_floor_mode(addrs.len(), true);
                     let pool_clone = Arc::clone(&pool);
                     let rng_clone_local = Arc::clone(&rng_clone);
                     join_bg.spawn(async move {

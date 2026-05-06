@@ -946,12 +946,6 @@ async fn build_family_floor_plan(
         if max_required < min_required {
             max_required = min_required;
         }
-        // We initialize target_required at base_required to prevent 0-writer blackouts
-        // caused by proactively dropping an idle DC to a single fragile connection.
-        // The Adaptive Floor constraint loop below will gracefully compress idle DCs
-        // (prioritized via has_bound_clients = false) to min_required only when global capacity is reached.
-        let desired_raw = base_required;
-        let target_required = desired_raw.clamp(min_required, max_required);
         let alive = endpoints
             .iter()
             .map(|endpoint| {
@@ -964,6 +958,15 @@ async fn build_family_floor_plan(
         family_active_total = family_active_total.saturating_add(alive);
         let writer_ids = list_writer_ids_for_endpoints(*dc, endpoints, live_writer_ids_by_addr);
         let has_bound_clients = has_bound_clients_on_endpoint(&writer_ids, bound_clients_by_writer);
+        // Idle adaptive DCs keep quorum coverage instead of expanding to every
+        // advertised endpoint. This prevents health checks from turning a large
+        // Telegram proxy-config snapshot into an unbounded writer fanout.
+        let desired_raw = if is_adaptive && !has_bound_clients {
+            min_required
+        } else {
+            base_required
+        };
+        let target_required = desired_raw.clamp(min_required, max_required);
 
         entries.push(DcFloorPlanEntry {
             dc: *dc,
@@ -1701,9 +1704,10 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
-    use super::reap_draining_writers;
+    use super::{build_family_floor_plan, reap_draining_writers};
     use crate::config::{GeneralConfig, MeRouteNoWriterMode, MeSocksKdfPolicy, MeWriterPickMode};
     use crate::crypto::SecureRandom;
+    use crate::network::IpFamily;
     use crate::network::probe::NetworkDecision;
     use crate::stats::Stats;
     use crate::transport::middle_proxy::codec::WriterCommand;
@@ -1886,6 +1890,68 @@ mod tests {
         pool.writers.write().await.push(writer);
         pool.registry.register_writer(writer_id, tx).await;
         pool.conn_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn adaptive_floor_idle_dc_uses_minimum_target_not_endpoint_fanout() {
+        let pool = make_pool(0).await;
+        let endpoints = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)), 443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 3)), 443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 4)), 443),
+        ];
+        let dc_endpoints = HashMap::from([(2, endpoints)]);
+        let live_addr_counts = HashMap::new();
+        let live_writer_ids_by_addr = HashMap::new();
+        let bound_clients_by_writer = HashMap::new();
+
+        let plan = build_family_floor_plan(
+            &pool,
+            IpFamily::V4,
+            &dc_endpoints,
+            &live_addr_counts,
+            &live_writer_ids_by_addr,
+            &bound_clients_by_writer,
+        )
+        .await;
+
+        let entry = plan.by_dc.get(&2).expect("dc floor entry");
+        assert_eq!(entry.min_required, 1);
+        assert!(entry.max_required >= 4);
+        assert_eq!(entry.target_required, 1);
+        assert_eq!(plan.target_writers_total, 1);
+    }
+
+    #[tokio::test]
+    async fn adaptive_floor_bound_dc_keeps_base_endpoint_target() {
+        let pool = make_pool(0).await;
+        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 443);
+        let endpoints = vec![
+            endpoint,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)), 443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 3)), 443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 4)), 443),
+        ];
+        let dc_endpoints = HashMap::from([(2, endpoints)]);
+        let live_addr_counts = HashMap::from([((2, endpoint), 1usize)]);
+        let live_writer_ids_by_addr = HashMap::from([((2, endpoint), vec![42u64])]);
+        let bound_clients_by_writer = HashMap::from([(42u64, 1usize)]);
+
+        let plan = build_family_floor_plan(
+            &pool,
+            IpFamily::V4,
+            &dc_endpoints,
+            &live_addr_counts,
+            &live_writer_ids_by_addr,
+            &bound_clients_by_writer,
+        )
+        .await;
+
+        let entry = plan.by_dc.get(&2).expect("dc floor entry");
+        assert_eq!(entry.min_required, 1);
+        assert_eq!(entry.target_required, 4);
+        assert_eq!(plan.target_writers_total, 4);
     }
 
     #[tokio::test]

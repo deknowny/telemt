@@ -364,7 +364,8 @@ impl MePool {
             .await?;
 
         let writer_id = self.next_writer_id.fetch_add(1, Ordering::Relaxed);
-        let contour = Arc::new(AtomicU8::new(contour.as_u8()));
+        let writer_contour = contour;
+        let contour = Arc::new(AtomicU8::new(writer_contour.as_u8()));
         let cancel = CancellationToken::new();
         let degraded = Arc::new(AtomicBool::new(false));
         let rtt_ema_ms_x10 = Arc::new(AtomicU32::new(0));
@@ -398,9 +399,35 @@ impl MePool {
             drain_deadline_epoch_secs: drain_deadline_epoch_secs.clone(),
             allow_drain_fallback: allow_drain_fallback.clone(),
         };
-        self.writers
-            .update(|writers| writers.push(writer.clone()))
+        let cap_result = self
+            .writers
+            .update(|writers| {
+                let current = writers
+                    .iter()
+                    .filter(|writer| !writer.draining.load(Ordering::Relaxed))
+                    .filter(|writer| {
+                        WriterContour::from_u8(writer.contour.load(Ordering::Relaxed))
+                            == writer_contour
+                    })
+                    .count();
+                let cap = match writer_contour {
+                    WriterContour::Active => self.adaptive_floor_active_cap_configured_total(),
+                    WriterContour::Warm => self.adaptive_floor_warm_cap_configured_total(),
+                    WriterContour::Draining => usize::MAX,
+                };
+                if current >= cap {
+                    return Err(ProxyError::Proxy(format!(
+                        "ME {writer_contour:?} writer cap reached after handshake"
+                    )));
+                }
+                writers.push(writer.clone());
+                Ok(())
+            })
             .await;
+        if let Err(error) = cap_result {
+            cancel.cancel();
+            return Err(error);
+        }
         self.registry.register_writer(writer_id, tx.clone()).await;
         self.registry.mark_writer_idle(writer_id).await;
         self.conn_count.fetch_add(1, Ordering::Relaxed);
