@@ -66,6 +66,15 @@ impl MePool {
                     .store(WriterContour::Active.as_u8(), Ordering::Relaxed);
             }
         }
+        let (active, warm, _) = self.non_draining_writer_counts_by_contour().await;
+        self.floor_runtime
+            .me_adaptive_floor_active_writers_current
+            .store(active as u64, Ordering::Relaxed);
+        self.floor_runtime
+            .me_adaptive_floor_warm_writers_current
+            .store(warm as u64, Ordering::Relaxed);
+        self.stats.set_me_writers_active_current_gauge(active as u64);
+        self.stats.set_me_writers_warm_current_gauge(warm as u64);
     }
 
     fn coverage_ratio(
@@ -310,6 +319,17 @@ impl MePool {
                             false,
                         )
                         .await;
+                    if connected {
+                        let (active, warm, _) = self.non_draining_writer_counts_by_contour().await;
+                        self.floor_runtime
+                            .me_adaptive_floor_active_writers_current
+                            .store(active as u64, Ordering::Relaxed);
+                        self.floor_runtime
+                            .me_adaptive_floor_warm_writers_current
+                            .store(warm as u64, Ordering::Relaxed);
+                        self.stats.set_me_writers_active_current_gauge(active as u64);
+                        self.stats.set_me_writers_warm_current_gauge(warm as u64);
+                    }
                     debug!(
                         dc = *dc,
                         pass = pass_idx + 1,

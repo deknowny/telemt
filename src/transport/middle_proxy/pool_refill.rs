@@ -282,6 +282,8 @@ impl MePool {
                             error = %e,
                             "ME immediate same-endpoint reconnect failed"
                         );
+                        self.delay_refill_retry(attempt, fast_retries, total_attempts)
+                            .await;
                     }
                 }
             }
@@ -316,10 +318,26 @@ impl MePool {
                 );
                 return true;
             }
+            self.delay_refill_retry(attempt, fast_retries, total_attempts)
+                .await;
         }
 
         self.stats.increment_me_refill_failed_total();
         false
+    }
+
+    async fn delay_refill_retry(&self, attempt: u32, fast_retries: u32, total_attempts: u32) {
+        if attempt + 1 >= fast_retries || total_attempts >= ME_REFILL_TOTAL_ATTEMPT_CAP {
+            return;
+        }
+
+        let base = self.reconnect_runtime.me_reconnect_backoff_base;
+        let cap = self.reconnect_runtime.me_reconnect_backoff_cap.max(base);
+        let shift = attempt.min(8);
+        let delay = base.saturating_mul(1u32 << shift).min(cap);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
     }
 
     pub(crate) fn trigger_immediate_refill_for_dc(
