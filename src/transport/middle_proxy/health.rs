@@ -1178,6 +1178,10 @@ async fn maybe_refresh_idle_writer_for_dc(
     bound_clients_by_writer: &HashMap<u64, usize>,
     idle_refresh_next_attempt: &mut HashMap<(i32, IpFamily), Instant>,
 ) {
+    if !idle_writer_pre_refresh_enabled(pool) {
+        return;
+    }
+
     if alive < required {
         return;
     }
@@ -1278,6 +1282,12 @@ async fn maybe_refresh_idle_writer_for_dc(
         required,
         "Idle writer refreshed before upstream idle timeout"
     );
+}
+
+fn idle_writer_pre_refresh_enabled(pool: &MePool) -> bool {
+    // ME keepalive already refreshes idle upstream sessions without replacing
+    // writers. Running both mechanisms creates avoidable connect/handshake churn.
+    !pool.writer_lifecycle.me_keepalive_enabled
 }
 
 fn has_bound_clients_on_endpoint(
@@ -1704,7 +1714,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
-    use super::{build_family_floor_plan, reap_draining_writers};
+    use super::{build_family_floor_plan, idle_writer_pre_refresh_enabled, reap_draining_writers};
     use crate::config::{GeneralConfig, MeRouteNoWriterMode, MeSocksKdfPolicy, MeWriterPickMode};
     use crate::crypto::SecureRandom;
     use crate::network::IpFamily;
@@ -1814,6 +1824,13 @@ mod tests {
             general.me_route_inline_recovery_attempts,
             general.me_route_inline_recovery_wait_ms,
         )
+    }
+
+    #[tokio::test]
+    async fn idle_writer_pre_refresh_is_disabled_when_keepalive_is_enabled() {
+        let pool = make_pool(0).await;
+
+        assert!(!idle_writer_pre_refresh_enabled(&pool));
     }
 
     async fn insert_draining_writer(
