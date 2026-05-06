@@ -37,6 +37,7 @@ const HEALTH_DRAIN_CLOSE_BUDGET_PER_CORE: usize = 16;
 const HEALTH_DRAIN_CLOSE_BUDGET_MIN: usize = 16;
 const HEALTH_DRAIN_CLOSE_BUDGET_MAX: usize = 256;
 const HEALTH_DRAIN_TIMEOUT_ENFORCER_INTERVAL_SECS: u64 = 1;
+const HEALTH_EXCESS_IDLE_DRAIN_BUDGET_PER_DC: usize = 2;
 
 #[derive(Debug, Clone)]
 struct DcFloorPlanEntry {
@@ -496,6 +497,24 @@ async fn check_family(
                 endpoint_count = endpoints.len(),
                 "Single-endpoint DC outage recovered"
             );
+        }
+
+        if alive > required {
+            let drained = drain_excess_idle_writers_for_dc(
+                pool,
+                dc,
+                family,
+                &endpoints,
+                alive,
+                required,
+                live_writer_ids_by_addr.as_ref(),
+                writer_idle_since.as_ref(),
+                bound_clients_by_writer.as_ref(),
+            )
+            .await;
+            if drained > 0 {
+                continue;
+            }
         }
 
         if alive >= required {
@@ -1164,6 +1183,65 @@ async fn maybe_swap_idle_writer_for_cap(
     true
 }
 
+async fn drain_excess_idle_writers_for_dc(
+    pool: &Arc<MePool>,
+    dc: i32,
+    family: IpFamily,
+    endpoints: &[SocketAddr],
+    alive: usize,
+    required: usize,
+    live_writer_ids_by_addr: &HashMap<(i32, SocketAddr), Vec<u64>>,
+    writer_idle_since: &HashMap<u64, u64>,
+    bound_clients_by_writer: &HashMap<u64, usize>,
+) -> usize {
+    if alive <= required {
+        return 0;
+    }
+
+    let now_epoch_secs = MePool::now_epoch_secs();
+    let mut candidates = Vec::<(u64, u64)>::new();
+    for endpoint in endpoints {
+        let Some(writer_ids) = live_writer_ids_by_addr.get(&(dc, *endpoint)) else {
+            continue;
+        };
+        for writer_id in writer_ids {
+            if bound_clients_by_writer.get(writer_id).copied().unwrap_or(0) > 0 {
+                continue;
+            }
+            let Some(idle_since_epoch_secs) = writer_idle_since.get(writer_id).copied() else {
+                continue;
+            };
+            candidates.push((
+                *writer_id,
+                now_epoch_secs.saturating_sub(idle_since_epoch_secs),
+            ));
+        }
+    }
+
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let drain_count = alive
+        .saturating_sub(required)
+        .min(HEALTH_EXCESS_IDLE_DRAIN_BUDGET_PER_DC)
+        .min(candidates.len());
+    for (writer_id, _) in candidates.iter().take(drain_count) {
+        pool.mark_writer_draining_with_timeout(*writer_id, pool.force_close_timeout(), false)
+            .await;
+    }
+    info!(
+        dc = %dc,
+        ?family,
+        alive,
+        required,
+        drained = drain_count,
+        "ME adaptive floor drained excess idle writers"
+    );
+    drain_count
+}
+
 async fn maybe_refresh_idle_writer_for_dc(
     pool: &Arc<MePool>,
     rng: &Arc<SecureRandom>,
@@ -1714,7 +1792,10 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
-    use super::{build_family_floor_plan, idle_writer_pre_refresh_enabled, reap_draining_writers};
+    use super::{
+        build_family_floor_plan, drain_excess_idle_writers_for_dc,
+        idle_writer_pre_refresh_enabled, reap_draining_writers,
+    };
     use crate::config::{GeneralConfig, MeRouteNoWriterMode, MeSocksKdfPolicy, MeWriterPickMode};
     use crate::crypto::SecureRandom;
     use crate::network::IpFamily;
@@ -1969,6 +2050,53 @@ mod tests {
         assert_eq!(entry.min_required, 1);
         assert_eq!(entry.target_required, 4);
         assert_eq!(plan.target_writers_total, 4);
+    }
+
+    #[tokio::test]
+    async fn adaptive_floor_drains_excess_idle_writers_with_budget() {
+        let pool = make_pool(0).await;
+        insert_live_writer(&pool, 1, 2).await;
+        insert_live_writer(&pool, 2, 2).await;
+        insert_live_writer(&pool, 3, 2).await;
+        pool.registry.mark_writer_idle(1).await;
+        pool.registry.mark_writer_idle(2).await;
+        pool.registry.mark_writer_idle(3).await;
+
+        let writers = pool.writers.read().await;
+        let endpoints = writers
+            .iter()
+            .map(|writer| writer.addr)
+            .collect::<Vec<_>>();
+        let live_writer_ids_by_addr = writers
+            .iter()
+            .map(|writer| ((writer.writer_dc, writer.addr), vec![writer.id]))
+            .collect::<HashMap<_, _>>();
+        drop(writers);
+        let writer_idle_since = pool.registry.writer_idle_since_snapshot().await;
+        let bound_clients_by_writer = HashMap::new();
+
+        let drained = drain_excess_idle_writers_for_dc(
+            &pool,
+            2,
+            IpFamily::V4,
+            &endpoints,
+            3,
+            1,
+            &live_writer_ids_by_addr,
+            &writer_idle_since,
+            &bound_clients_by_writer,
+        )
+        .await;
+
+        assert_eq!(drained, 2);
+        let draining = pool
+            .writers
+            .read()
+            .await
+            .iter()
+            .filter(|writer| writer.draining.load(Ordering::Relaxed))
+            .count();
+        assert_eq!(draining, 2);
     }
 
     #[tokio::test]
