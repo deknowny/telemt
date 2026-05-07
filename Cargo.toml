@@ -94,7 +94,3 @@ futures = "0.3"
 [[bench]]
 name = "crypto_bench"
 harness = false
-
-[profile.release]
-lto = "fat"
-codegen-units = 1
