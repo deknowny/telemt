@@ -1724,19 +1724,14 @@ impl MePool {
         if self.floor_mode() != MeFloorMode::Adaptive {
             return base_required;
         }
-        let min_writers = if endpoint_count == 1 {
-            (self
-                .floor_runtime
-                .me_adaptive_floor_min_writers_single_endpoint
-                .load(Ordering::Relaxed) as usize)
-                .max(1)
-        } else {
-            (self
-                .floor_runtime
-                .me_adaptive_floor_min_writers_multi_endpoint
-                .load(Ordering::Relaxed) as usize)
-                .max(1)
-        };
+        if endpoint_count == 1 {
+            return base_required;
+        }
+        let min_writers = (self
+            .floor_runtime
+            .me_adaptive_floor_min_writers_multi_endpoint
+            .load(Ordering::Relaxed) as usize)
+            .max(1);
         base_required.min(min_writers)
     }
 

@@ -17,6 +17,7 @@ use crate::crypto::SecureRandom;
 use crate::error::{ProxyError, Result};
 use crate::protocol::constants::{RPC_CLOSE_EXT_U32, RPC_PING_U32};
 
+use super::MeResponse;
 use super::codec::{RpcWriter, WriterCommand};
 use super::pool::{MePool, MeWriter, WriterContour};
 use super::reader::reader_loop;
@@ -25,7 +26,7 @@ use super::wire::build_proxy_req_payload;
 const ME_ACTIVE_PING_SECS: u64 = 25;
 const ME_ACTIVE_PING_JITTER_SECS: i64 = 5;
 const ME_IDLE_KEEPALIVE_MAX_SECS: u64 = 5;
-const ME_RPC_PROXY_REQ_RESPONSE_WAIT_MS: u64 = 700;
+const ME_RPC_PROXY_REQ_RESPONSE_WAIT_MS: u64 = 5_000;
 const ME_PING_TRACKER_CLEANUP_EVERY: u32 = 32;
 
 #[derive(Clone, Copy)]
@@ -192,8 +193,12 @@ async fn rpc_proxy_req_signal_loop(
         _ = tokio::time::sleep(Duration::from_millis(startup_jitter_ms)) => {}
     }
 
+    let mut first_signal = true;
     loop {
-        let wait = {
+        let wait = if first_signal {
+            first_signal = false;
+            Duration::ZERO
+        } else {
             let jitter_cap_ms = interval.as_millis() / 2;
             let effective_jitter_ms = keepalive_jitter_signal
                 .as_millis()
@@ -214,6 +219,10 @@ async fn rpc_proxy_req_signal_loop(
 
         let Some(meta) = pool.registry.get_last_writer_meta(writer_id).await else {
             stats_signal.increment_me_rpc_proxy_req_signal_skipped_no_meta_total();
+            debug!(
+                writer_id,
+                rpc_proxy_req_every_secs, "ME rpc_proxy_req signal skipped: no writer metadata"
+            );
             continue;
         };
 
@@ -242,15 +251,38 @@ async fn rpc_proxy_req_signal_loop(
 
         stats_signal.increment_me_rpc_proxy_req_signal_sent_total();
 
-        if matches!(
-            tokio::time::timeout(
-                Duration::from_millis(ME_RPC_PROXY_REQ_RESPONSE_WAIT_MS),
-                service_rx.recv(),
-            )
-            .await,
-            Ok(Some(_))
-        ) {
-            stats_signal.increment_me_rpc_proxy_req_signal_response_total();
+        let response_started_at = Instant::now();
+        match tokio::time::timeout(
+            Duration::from_millis(ME_RPC_PROXY_REQ_RESPONSE_WAIT_MS),
+            service_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(_)) => {
+                stats_signal.increment_me_rpc_proxy_req_signal_response_total();
+                debug!(
+                    writer_id,
+                    conn_id,
+                    wait_ms = response_started_at.elapsed().as_millis() as u64,
+                    "ME rpc_proxy_req signal response observed"
+                );
+            }
+            Ok(None) => {
+                stats_signal.increment_me_rpc_proxy_req_signal_failed_total();
+                debug!(
+                    writer_id,
+                    conn_id, "ME rpc_proxy_req signal response channel closed"
+                );
+            }
+            Err(_) => {
+                stats_signal.increment_me_rpc_proxy_req_signal_timeout_total();
+                debug!(
+                    writer_id,
+                    conn_id,
+                    timeout_ms = ME_RPC_PROXY_REQ_RESPONSE_WAIT_MS,
+                    "ME rpc_proxy_req signal response timeout"
+                );
+            }
         }
 
         let mut close_payload = Vec::with_capacity(12);
@@ -528,7 +560,19 @@ impl MePool {
                     };
                     if idle_close_by_peer {
                         stats_reader_close.increment_me_idle_close_by_peer_total();
-                        info!(writer_id, "ME socket closed by peer on idle writer");
+                        let writer_idle_secs = reg
+                            .writer_idle_since_for_writer_ids(&[writer_id])
+                            .await
+                            .get(&writer_id)
+                            .map(|idle_since| MePool::now_epoch_secs().saturating_sub(*idle_since));
+                        info!(
+                            writer_id,
+                            writer_idle_secs,
+                            keepalive_enabled,
+                            keepalive_interval_secs = keepalive_interval.as_secs(),
+                            rpc_proxy_req_every_secs,
+                            "ME socket closed by peer on idle writer"
+                        );
                     }
                     if let Err(e) = res
                         && !idle_close_by_peer
@@ -565,8 +609,6 @@ impl MePool {
     }
 
     pub(crate) async fn remove_writer_and_close_clients(self: &Arc<Self>, writer_id: u64) {
-        // Full client cleanup now happens inside `registry.writer_lost` to keep
-        // writer reap/remove paths strictly non-blocking per connection.
         let _ = self
             .remove_writer_with_mode(writer_id, WriterTeardownMode::Any)
             .await;
@@ -633,10 +675,18 @@ impl MePool {
         }
         // State invariant:
         // - writer is removed from `self.writers` (pool visibility),
-        // - writer is removed from registry routing/binding maps via `writer_lost`.
-        // The close command below is only a best-effort accelerator for task shutdown.
-        // Cleanup progress must never depend on command-channel availability.
-        let _ = self.registry.writer_lost(writer_id).await;
+        // - writer is removed from registry routing/binding maps via `writer_lost`,
+        // - client sessions bound to the lost writer are closed. Rebinding an
+        //   existing MTProto client stream onto a fresh ME writer loses the
+        //   upstream TCP/session state and shows up as client crypto desync.
+        let lost_clients = self.registry.writer_lost(writer_id).await;
+        for bound in lost_clients {
+            let _ = self
+                .registry
+                .route_nowait(bound.conn_id, MeResponse::Close)
+                .await;
+            let _ = self.registry.unregister(bound.conn_id).await;
+        }
         self.rtt_stats.lock().await.remove(&writer_id);
         if let Some(tx) = close_tx {
             // Keep teardown critical path non-blocking: close is best-effort only.

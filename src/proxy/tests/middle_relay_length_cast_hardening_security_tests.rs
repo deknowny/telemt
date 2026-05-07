@@ -32,6 +32,23 @@ fn intermediate_secure_wire_len_rejects_addition_overflow() {
 }
 
 #[test]
+fn me_data_flags_do_not_set_client_quickack_frame_bit() {
+    assert!(!should_mark_me_data_frame_quickack(RPC_FLAG_QUICKACK));
+    assert!(!should_mark_me_data_frame_quickack(
+        RPC_FLAG_QUICKACK | RPC_FLAG_INTERMEDIATE | RPC_FLAG_PAD
+    ));
+}
+
+#[test]
+fn client_quickack_ack_always_sets_transport_marker_bit() {
+    assert_eq!(
+        client_quickack_confirm(0x1234_5678),
+        RPC_FLAG_QUICKACK | 0x1234_5678
+    );
+    assert_eq!(client_quickack_confirm(0xf234_5678), 0xf234_5678);
+}
+
+#[test]
 fn desync_forensics_len_bytes_marks_truncation_for_oversize_values() {
     let (small_bytes, small_truncated) = desync_forensics_len_bytes(0x1020_3040);
     assert_eq!(small_bytes, 0x1020_3040u32.to_le_bytes());
@@ -53,6 +70,7 @@ fn report_desync_frame_too_large_preserves_full_length_in_error_message() {
         started_at: Instant::now(),
         bytes_c2me: 7,
         bytes_me2c: Arc::new(AtomicU64::new(9)),
+        d2c: Arc::new(RelayD2cForensics::default()),
         desync_all_full: false,
     };
 

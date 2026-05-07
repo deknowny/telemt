@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use super::MeResponse;
 use super::codec::WriterCommand;
 use super::pool::{MePool, MeWriter, WriterContour};
 use super::registry::ConnMeta;
@@ -155,25 +156,6 @@ async fn current_writer_ids(pool: &Arc<MePool>) -> HashSet<u64> {
         .collect()
 }
 
-async fn bind_conn_to_writer(pool: &Arc<MePool>, writer_id: u64, port: u16) -> u64 {
-    let (conn_id, _rx) = pool.registry.register().await;
-    let bound = pool
-        .registry
-        .bind_writer(
-            conn_id,
-            writer_id,
-            ConnMeta {
-                target_dc: 2,
-                client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
-                our_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
-                proto_flags: 0,
-            },
-        )
-        .await;
-    assert!(bound, "writer binding must succeed");
-    conn_id
-}
-
 #[tokio::test]
 async fn remove_draining_writer_does_not_quarantine_flapping_endpoint() {
     let pool = make_pool().await;
@@ -230,11 +212,33 @@ async fn positive_remove_writer_cleans_bound_registry_routes() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 12, 0, 88)), 443);
     insert_writer(&pool, writer_id, 2, addr, false, Instant::now()).await;
 
-    let conn_id = bind_conn_to_writer(&pool, writer_id, 7301).await;
+    let (conn_id, mut rx) = pool.registry.register().await;
+    let bound = pool
+        .registry
+        .bind_writer(
+            conn_id,
+            writer_id,
+            ConnMeta {
+                target_dc: 2,
+                client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7301),
+                our_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
+                proto_flags: 0,
+            },
+        )
+        .await;
+    assert!(bound, "writer binding must succeed");
     assert!(pool.registry.get_writer(conn_id).await.is_some());
 
     pool.remove_writer_and_close_clients(writer_id).await;
 
+    assert!(
+        matches!(rx.recv().await, Some(MeResponse::Close)),
+        "bound client relay must be told to close when its ME writer is lost"
+    );
+    assert!(
+        rx.recv().await.is_none(),
+        "bound client route must be unregistered after close notification"
+    );
     assert!(pool.registry.get_writer(conn_id).await.is_none());
     assert!(!current_writer_ids(&pool).await.contains(&writer_id));
     assert_eq!(pool.conn_count.load(Ordering::Relaxed), 0);

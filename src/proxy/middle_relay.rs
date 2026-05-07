@@ -80,7 +80,56 @@ struct RelayForensicsState {
     started_at: Instant,
     bytes_c2me: u64,
     bytes_me2c: Arc<AtomicU64>,
+    d2c: Arc<RelayD2cForensics>,
     desync_all_full: bool,
+}
+
+#[derive(Default)]
+struct RelayD2cForensics {
+    last_kind: AtomicU64,
+    last_at_ms: AtomicU64,
+    last_data_flags: AtomicU64,
+    last_data_len: AtomicU64,
+    last_data_quickack_suppressed: AtomicU64,
+    last_ack_confirm_raw: AtomicU64,
+    last_ack_confirm_wire: AtomicU64,
+    data_frames: AtomicU64,
+    ack_frames: AtomicU64,
+}
+
+impl RelayD2cForensics {
+    const KIND_NONE: u64 = 0;
+    const KIND_DATA: u64 = 1;
+    const KIND_ACK: u64 = 2;
+
+    fn mark_data(&self, at_ms: u64, flags: u32, len: usize, quickack_suppressed: bool) {
+        self.data_frames.fetch_add(1, Ordering::Relaxed);
+        self.last_data_flags.store(flags as u64, Ordering::Relaxed);
+        self.last_data_len.store(len as u64, Ordering::Relaxed);
+        self.last_data_quickack_suppressed
+            .store(quickack_suppressed as u64, Ordering::Relaxed);
+        self.last_at_ms.store(at_ms, Ordering::Relaxed);
+        self.last_kind.store(Self::KIND_DATA, Ordering::Relaxed);
+    }
+
+    fn mark_ack(&self, at_ms: u64, confirm_raw: u32, confirm_wire: u32) {
+        self.ack_frames.fetch_add(1, Ordering::Relaxed);
+        self.last_ack_confirm_raw
+            .store(confirm_raw as u64, Ordering::Relaxed);
+        self.last_ack_confirm_wire
+            .store(confirm_wire as u64, Ordering::Relaxed);
+        self.last_at_ms.store(at_ms, Ordering::Relaxed);
+        self.last_kind.store(Self::KIND_ACK, Ordering::Relaxed);
+    }
+
+    fn last_kind_label(kind: u64) -> &'static str {
+        match kind {
+            Self::KIND_NONE => "none",
+            Self::KIND_DATA => "data",
+            Self::KIND_ACK => "ack",
+            _ => "none",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -484,6 +533,20 @@ fn report_desync_frame_too_large_in(
     let emit_full = should_emit_full_desync_in(shared, dedup_key, state.desync_all_full, now);
     let duration_ms = state.started_at.elapsed().as_millis() as u64;
     let bytes_me2c = state.bytes_me2c.load(Ordering::Relaxed);
+    let last_d2c_kind = state.d2c.last_kind.load(Ordering::Relaxed);
+    let last_d2c_at_ms = state.d2c.last_at_ms.load(Ordering::Relaxed);
+    let last_d2c_age_ms = duration_ms.saturating_sub(last_d2c_at_ms);
+    let session_d2c_data_frames = state.d2c.data_frames.load(Ordering::Relaxed);
+    let session_d2c_ack_frames = state.d2c.ack_frames.load(Ordering::Relaxed);
+    let last_data_flags = state.d2c.last_data_flags.load(Ordering::Relaxed) as u32;
+    let last_data_len = state.d2c.last_data_len.load(Ordering::Relaxed);
+    let last_data_quickack_suppressed = state
+        .d2c
+        .last_data_quickack_suppressed
+        .load(Ordering::Relaxed)
+        != 0;
+    let last_ack_confirm_raw = state.d2c.last_ack_confirm_raw.load(Ordering::Relaxed) as u32;
+    let last_ack_confirm_wire = state.d2c.last_ack_confirm_wire.load(Ordering::Relaxed) as u32;
 
     stats.increment_desync_total();
     stats.increment_relay_protocol_desync_close_total();
@@ -501,6 +564,17 @@ fn report_desync_frame_too_large_in(
             duration_ms,
             bytes_c2me = state.bytes_c2me,
             bytes_me2c,
+            last_d2c_kind = RelayD2cForensics::last_kind_label(last_d2c_kind),
+            last_d2c_at_ms,
+            last_d2c_age_ms,
+            session_d2c_data_frames,
+            session_d2c_ack_frames,
+            last_data_flags = format_args!("0x{:08x}", last_data_flags),
+            last_data_len,
+            last_data_quickack_suppressed,
+            last_ack_confirm_raw = format_args!("0x{:08x}", last_ack_confirm_raw),
+            last_ack_confirm_wire = format_args!("0x{:08x}", last_ack_confirm_wire),
+            last_ack_marker_was_present = (last_ack_confirm_raw & RPC_FLAG_QUICKACK) != 0,
             raw_len = len,
             raw_len_hex = format_args!("0x{:08x}", len),
             raw_len_bytes_truncated = len_buf_truncated,
@@ -536,6 +610,14 @@ fn report_desync_frame_too_large_in(
             duration_ms,
             bytes_c2me = state.bytes_c2me,
             bytes_me2c,
+            last_d2c_kind = RelayD2cForensics::last_kind_label(last_d2c_kind),
+            last_d2c_age_ms,
+            session_d2c_data_frames,
+            session_d2c_ack_frames,
+            last_data_flags = format_args!("0x{:08x}", last_data_flags),
+            last_data_quickack_suppressed,
+            last_ack_confirm_raw = format_args!("0x{:08x}", last_ack_confirm_raw),
+            last_ack_confirm_wire = format_args!("0x{:08x}", last_ack_confirm_wire),
             raw_len = len,
             frames_ok = frame_counter,
             dedup_window_secs = DESYNC_DEDUP_WINDOW.as_secs(),
@@ -719,6 +801,15 @@ fn observe_me_d2c_flush_event(
     if let Some(duration_us) = flush_duration_us {
         stats.observe_me_d2c_flush_duration_us(duration_us);
     }
+}
+
+fn middle_proxy_our_addr_for_me(config: &ProxyConfig, local_addr: SocketAddr) -> SocketAddr {
+    let public_port = config
+        .general
+        .links
+        .public_port
+        .unwrap_or(local_addr.port());
+    SocketAddr::new(local_addr.ip(), public_port)
 }
 
 #[cfg(test)]
@@ -1085,6 +1176,7 @@ where
     let (conn_id, me_rx) = me_pool.registry().register().await;
     let trace_id = session_id;
     let bytes_me2c = Arc::new(AtomicU64::new(0));
+    let d2c_forensics = Arc::new(RelayD2cForensics::default());
     let mut forensics = RelayForensicsState {
         trace_id,
         conn_id,
@@ -1094,6 +1186,7 @@ where
         started_at: Instant::now(),
         bytes_c2me: 0,
         bytes_me2c: bytes_me2c.clone(),
+        d2c: d2c_forensics.clone(),
         desync_all_full: config.general.desync_all_full,
     };
 
@@ -1144,7 +1237,17 @@ where
         "ME relay started"
     );
 
-    let translated_local_addr = me_pool.translate_our_addr(local_addr);
+    let advertised_local_addr = middle_proxy_our_addr_for_me(&config, local_addr);
+    let translated_local_addr = me_pool.translate_our_addr(advertised_local_addr);
+    debug!(
+        conn_id,
+        trace_id = format_args!("0x{:016x}", trace_id),
+        local_addr = %local_addr,
+        advertised_local_addr = %advertised_local_addr,
+        translated_local_addr = %translated_local_addr,
+        public_port = config.general.links.public_port,
+        "ME relay advertised local endpoint"
+    );
 
     let frame_limit = config.general.max_client_frame;
     let mut relay_idle_policy = RelayClientIdlePolicy::from_config(&config);
@@ -1213,6 +1316,7 @@ where
     let traffic_lease_me_writer = traffic_lease.clone();
     let last_downstream_activity_ms_clone = last_downstream_activity_ms.clone();
     let bytes_me2c_clone = bytes_me2c.clone();
+    let d2c_forensics_clone = d2c_forensics.clone();
     let d2c_flush_policy = MeD2cFlushPolicy::from_config(&config);
     let me_writer = tokio::spawn(async move {
         let mut writer = crypto_writer;
@@ -1257,6 +1361,8 @@ where
                         d2c_flush_policy.quota_soft_overshoot_bytes,
                         traffic_lease_me_writer.as_ref(),
                         bytes_me2c_clone.as_ref(),
+                        d2c_forensics_clone.as_ref(),
+                        session_started_at,
                         conn_id,
                         d2c_flush_policy.ack_flush_immediate,
                         false,
@@ -1318,6 +1424,8 @@ where
                             d2c_flush_policy.quota_soft_overshoot_bytes,
                             traffic_lease_me_writer.as_ref(),
                             bytes_me2c_clone.as_ref(),
+                            d2c_forensics_clone.as_ref(),
+                            session_started_at,
                             conn_id,
                             d2c_flush_policy.ack_flush_immediate,
                             true,
@@ -1382,6 +1490,8 @@ where
                                     d2c_flush_policy.quota_soft_overshoot_bytes,
                                     traffic_lease_me_writer.as_ref(),
                                     bytes_me2c_clone.as_ref(),
+                                    d2c_forensics_clone.as_ref(),
+                                    session_started_at,
                                     conn_id,
                                     d2c_flush_policy.ack_flush_immediate,
                                     true,
@@ -1448,6 +1558,8 @@ where
                                         d2c_flush_policy.quota_soft_overshoot_bytes,
                                         traffic_lease_me_writer.as_ref(),
                                         bytes_me2c_clone.as_ref(),
+                                        d2c_forensics_clone.as_ref(),
+                                        session_started_at,
                                         conn_id,
                                         d2c_flush_policy.ack_flush_immediate,
                                         true,
@@ -2288,6 +2400,7 @@ async fn process_me_writer_response<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let d2c_forensics = RelayD2cForensics::default();
     process_me_writer_response_with_traffic_lease(
         response,
         client_writer,
@@ -2301,6 +2414,8 @@ where
         quota_soft_overshoot_bytes,
         None,
         bytes_me2c,
+        &d2c_forensics,
+        Instant::now(),
         conn_id,
         ack_flush_immediate,
         batched,
@@ -2321,6 +2436,8 @@ async fn process_me_writer_response_with_traffic_lease<W>(
     quota_soft_overshoot_bytes: u64,
     traffic_lease: Option<&Arc<TrafficLease>>,
     bytes_me2c: &AtomicU64,
+    d2c_forensics: &RelayD2cForensics,
+    session_started_at: Instant,
     conn_id: u64,
     ack_flush_immediate: bool,
     batched: bool,
@@ -2330,10 +2447,24 @@ where
 {
     match response {
         MeResponse::Data { flags, data, .. } => {
+            let data_quickack_suppressed =
+                (flags & RPC_FLAG_QUICKACK) != 0 && !should_mark_me_data_frame_quickack(flags);
             if batched {
-                trace!(conn_id, bytes = data.len(), flags, "ME->C data (batched)");
+                trace!(
+                    conn_id,
+                    bytes = data.len(),
+                    flags,
+                    data_quickack_suppressed,
+                    "ME->C data (batched)"
+                );
             } else {
-                trace!(conn_id, bytes = data.len(), flags, "ME->C data");
+                trace!(
+                    conn_id,
+                    bytes = data.len(),
+                    flags,
+                    data_quickack_suppressed,
+                    "ME->C data"
+                );
             }
             let data_len = data.len() as u64;
             if let (Some(limit), Some(user_stats)) = (quota_limit, quota_user_stats) {
@@ -2365,12 +2496,21 @@ where
                 };
 
             bytes_me2c.fetch_add(data_len, Ordering::Relaxed);
+            d2c_forensics.mark_data(
+                session_started_at.elapsed().as_millis() as u64,
+                flags,
+                data.len(),
+                data_quickack_suppressed,
+            );
             if let Some(user_stats) = quota_user_stats {
                 stats.add_user_octets_to_handle(user_stats, data_len);
             } else {
                 stats.add_user_octets_to(user, data_len);
             }
             stats.increment_me_d2c_data_frames_total();
+            if data_quickack_suppressed {
+                stats.increment_me_d2c_data_quickack_flag_suppressed_total();
+            }
             stats.add_me_d2c_payload_bytes_total(data_len);
             stats.increment_me_d2c_write_mode(write_mode);
 
@@ -2381,14 +2521,34 @@ where
             })
         }
         MeResponse::Ack(confirm) => {
+            let confirm_wire = client_quickack_confirm(confirm);
+            let marker_present = (confirm & RPC_FLAG_QUICKACK) != 0;
             if batched {
-                trace!(conn_id, confirm, "ME->C quickack (batched)");
+                trace!(
+                    conn_id,
+                    confirm_raw = format_args!("0x{:08x}", confirm),
+                    confirm_wire = format_args!("0x{:08x}", confirm_wire),
+                    marker_present,
+                    "ME->C quickack (batched)"
+                );
             } else {
-                trace!(conn_id, confirm, "ME->C quickack");
+                trace!(
+                    conn_id,
+                    confirm_raw = format_args!("0x{:08x}", confirm),
+                    confirm_wire = format_args!("0x{:08x}", confirm_wire),
+                    marker_present,
+                    "ME->C quickack"
+                );
             }
             wait_for_traffic_budget(traffic_lease, RateDirection::Down, 4).await;
             write_client_ack(client_writer, proto_tag, confirm).await?;
+            d2c_forensics.mark_ack(
+                session_started_at.elapsed().as_millis() as u64,
+                confirm,
+                confirm_wire,
+            );
             stats.increment_me_d2c_ack_frames_total();
+            stats.observe_me_d2c_ack_marker(marker_present);
 
             Ok(MeWriterResponseOutcome::Continue {
                 frames: 1,
@@ -2432,6 +2592,16 @@ fn compute_intermediate_secure_wire_len(
     Ok((len_val, total))
 }
 
+fn should_mark_me_data_frame_quickack(_flags: u32) -> bool {
+    // RPC_PROXY_ANS flags belong to the ME RPC envelope. Client quickack
+    // responses are delivered separately as RPC_SIMPLE_ACK.
+    false
+}
+
+fn client_quickack_confirm(confirm: u32) -> u32 {
+    confirm | RPC_FLAG_QUICKACK
+}
+
 async fn write_client_payload<W>(
     client_writer: &mut CryptoWriter<W>,
     proto_tag: ProtoTag,
@@ -2443,7 +2613,7 @@ async fn write_client_payload<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let quickack = (flags & RPC_FLAG_QUICKACK) != 0;
+    let quickack = should_mark_me_data_frame_quickack(flags);
 
     let write_mode = match proto_tag {
         ProtoTag::Abridged => {
@@ -2587,6 +2757,7 @@ async fn write_client_ack<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let confirm = client_quickack_confirm(confirm);
     let bytes = if proto_tag == ProtoTag::Abridged {
         confirm.to_be_bytes()
     } else {
@@ -2625,6 +2796,34 @@ mod middle_relay_zero_length_frame_security_tests;
 #[cfg(test)]
 #[path = "tests/middle_relay_tiny_frame_debt_security_tests.rs"]
 mod middle_relay_tiny_frame_debt_security_tests;
+
+#[cfg(test)]
+mod middle_proxy_our_addr_tests {
+    use super::*;
+
+    #[test]
+    fn middle_proxy_our_addr_uses_public_port_when_configured() {
+        let mut config = ProxyConfig::default();
+        config.general.links.public_port = Some(443);
+        let local_addr: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+
+        assert_eq!(
+            middle_proxy_our_addr_for_me(&config, local_addr),
+            "127.0.0.1:443".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn middle_proxy_our_addr_keeps_listener_port_without_public_override() {
+        let config = ProxyConfig::default();
+        let local_addr: SocketAddr = "127.0.0.1:8443".parse().unwrap();
+
+        assert_eq!(
+            middle_proxy_our_addr_for_me(&config, local_addr),
+            local_addr
+        );
+    }
+}
 
 #[cfg(test)]
 #[path = "tests/middle_relay_tiny_frame_debt_concurrency_security_tests.rs"]

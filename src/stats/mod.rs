@@ -128,6 +128,7 @@ pub struct Stats {
     me_rpc_proxy_req_signal_failed_total: AtomicU64,
     me_rpc_proxy_req_signal_skipped_no_meta_total: AtomicU64,
     me_rpc_proxy_req_signal_response_total: AtomicU64,
+    me_rpc_proxy_req_signal_timeout_total: AtomicU64,
     me_rpc_proxy_req_signal_close_sent_total: AtomicU64,
     me_reconnect_attempts: AtomicU64,
     me_reconnect_success: AtomicU64,
@@ -200,6 +201,9 @@ pub struct Stats {
     me_d2c_flush_reason_close_total: AtomicU64,
     me_d2c_data_frames_total: AtomicU64,
     me_d2c_ack_frames_total: AtomicU64,
+    me_d2c_data_quickack_flag_suppressed_total: AtomicU64,
+    me_d2c_ack_marker_present_total: AtomicU64,
+    me_d2c_ack_marker_added_total: AtomicU64,
     me_d2c_payload_bytes_total: AtomicU64,
     me_d2c_write_mode_coalesced_total: AtomicU64,
     me_d2c_write_mode_split_total: AtomicU64,
@@ -786,6 +790,12 @@ impl Stats {
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
+    pub fn increment_me_rpc_proxy_req_signal_timeout_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_rpc_proxy_req_signal_timeout_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     pub fn increment_me_rpc_proxy_req_signal_close_sent_total(&self) {
         if self.telemetry_me_allows_normal() {
             self.me_rpc_proxy_req_signal_close_sent_total
@@ -1021,6 +1031,24 @@ impl Stats {
     pub fn increment_me_d2c_ack_frames_total(&self) {
         if self.telemetry_me_allows_normal() {
             self.me_d2c_ack_frames_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_d2c_data_quickack_flag_suppressed_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_d2c_data_quickack_flag_suppressed_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn observe_me_d2c_ack_marker(&self, marker_present: bool) {
+        if !self.telemetry_me_allows_normal() {
+            return;
+        }
+        if marker_present {
+            self.me_d2c_ack_marker_present_total
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.me_d2c_ack_marker_added_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
     pub fn add_me_d2c_payload_bytes_total(&self, bytes: u64) {
@@ -1770,6 +1798,10 @@ impl Stats {
         self.me_rpc_proxy_req_signal_response_total
             .load(Ordering::Relaxed)
     }
+    pub fn get_me_rpc_proxy_req_signal_timeout_total(&self) -> u64 {
+        self.me_rpc_proxy_req_signal_timeout_total
+            .load(Ordering::Relaxed)
+    }
     pub fn get_me_rpc_proxy_req_signal_close_sent_total(&self) -> u64 {
         self.me_rpc_proxy_req_signal_close_sent_total
             .load(Ordering::Relaxed)
@@ -2019,6 +2051,16 @@ impl Stats {
     }
     pub fn get_me_d2c_ack_frames_total(&self) -> u64 {
         self.me_d2c_ack_frames_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_d2c_data_quickack_flag_suppressed_total(&self) -> u64 {
+        self.me_d2c_data_quickack_flag_suppressed_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_d2c_ack_marker_present_total(&self) -> u64 {
+        self.me_d2c_ack_marker_present_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_d2c_ack_marker_added_total(&self) -> u64 {
+        self.me_d2c_ack_marker_added_total.load(Ordering::Relaxed)
     }
     pub fn get_me_d2c_payload_bytes_total(&self) -> u64 {
         self.me_d2c_payload_bytes_total.load(Ordering::Relaxed)

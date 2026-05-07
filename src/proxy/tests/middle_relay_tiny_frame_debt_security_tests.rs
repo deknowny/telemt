@@ -33,6 +33,7 @@ fn make_forensics(conn_id: u64, started_at: Instant) -> RelayForensicsState {
         started_at,
         bytes_c2me: 0,
         bytes_me2c: Arc::new(AtomicU64::new(0)),
+        d2c: Arc::new(RelayD2cForensics::default()),
         desync_all_full: false,
     }
 }

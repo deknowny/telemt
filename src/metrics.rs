@@ -1098,6 +1098,24 @@ async fn render_metrics(
 
     let _ = writeln!(
         out,
+        "# HELP telemt_me_rpc_proxy_req_signal_timeout_total Service RPC_PROXY_REQ activity signal response timeouts"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_rpc_proxy_req_signal_timeout_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_rpc_proxy_req_signal_timeout_total {}",
+        if me_allows_normal {
+            stats.get_me_rpc_proxy_req_signal_timeout_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
         "# HELP telemt_me_rpc_proxy_req_signal_close_sent_total Service RPC_CLOSE_EXT sent after activity signals"
     );
     let _ = writeln!(
@@ -1669,6 +1687,48 @@ async fn render_metrics(
         "telemt_me_d2c_ack_frames_total {}",
         if me_allows_normal {
             stats.get_me_d2c_ack_frames_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_d2c_data_quickack_flag_suppressed_total ME data frames whose RPC flags had quickack but client data framing suppressed it"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_d2c_data_quickack_flag_suppressed_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_d2c_data_quickack_flag_suppressed_total {}",
+        if me_allows_normal {
+            stats.get_me_d2c_data_quickack_flag_suppressed_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_d2c_ack_marker_total ME quick-ack confirm marker handling before writing to client"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_d2c_ack_marker_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_d2c_ack_marker_total{{state=\"present\"}} {}",
+        if me_allows_normal {
+            stats.get_me_d2c_ack_marker_present_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_d2c_ack_marker_total{{state=\"added\"}} {}",
+        if me_allows_normal {
+            stats.get_me_d2c_ack_marker_added_total()
         } else {
             0
         }
@@ -3364,6 +3424,7 @@ mod tests {
         stats.increment_me_rpc_proxy_req_signal_failed_total();
         stats.increment_me_rpc_proxy_req_signal_skipped_no_meta_total();
         stats.increment_me_rpc_proxy_req_signal_response_total();
+        stats.increment_me_rpc_proxy_req_signal_timeout_total();
         stats.increment_me_rpc_proxy_req_signal_close_sent_total();
         stats.increment_me_idle_close_by_peer_total();
         stats.increment_relay_idle_soft_mark_total();
@@ -3376,6 +3437,9 @@ mod tests {
         stats.increment_me_d2c_flush_reason(crate::stats::MeD2cFlushReason::AckImmediate);
         stats.increment_me_d2c_data_frames_total();
         stats.increment_me_d2c_ack_frames_total();
+        stats.increment_me_d2c_data_quickack_flag_suppressed_total();
+        stats.observe_me_d2c_ack_marker(false);
+        stats.observe_me_d2c_ack_marker(true);
         stats.add_me_d2c_payload_bytes_total(1800);
         stats.increment_me_d2c_write_mode(crate::stats::MeD2cWriteMode::Coalesced);
         stats.increment_me_d2c_quota_reject_total(crate::stats::MeD2cQuotaRejectStage::PostWrite);
@@ -3422,6 +3486,7 @@ mod tests {
         assert!(output.contains("telemt_me_rpc_proxy_req_signal_failed_total 1"));
         assert!(output.contains("telemt_me_rpc_proxy_req_signal_skipped_no_meta_total 1"));
         assert!(output.contains("telemt_me_rpc_proxy_req_signal_response_total 1"));
+        assert!(output.contains("telemt_me_rpc_proxy_req_signal_timeout_total 1"));
         assert!(output.contains("telemt_me_rpc_proxy_req_signal_close_sent_total 1"));
         assert!(output.contains("telemt_me_idle_close_by_peer_total 1"));
         assert!(output.contains("telemt_relay_idle_soft_mark_total 1"));
@@ -3434,6 +3499,9 @@ mod tests {
         assert!(output.contains("telemt_me_d2c_flush_reason_total{reason=\"ack_immediate\"} 1"));
         assert!(output.contains("telemt_me_d2c_data_frames_total 1"));
         assert!(output.contains("telemt_me_d2c_ack_frames_total 1"));
+        assert!(output.contains("telemt_me_d2c_data_quickack_flag_suppressed_total 1"));
+        assert!(output.contains("telemt_me_d2c_ack_marker_total{state=\"present\"} 1"));
+        assert!(output.contains("telemt_me_d2c_ack_marker_total{state=\"added\"} 1"));
         assert!(output.contains("telemt_me_d2c_payload_bytes_total 1800"));
         assert!(output.contains("telemt_me_d2c_write_mode_total{mode=\"coalesced\"} 1"));
         assert!(output.contains("telemt_me_d2c_quota_reject_total{stage=\"post_write\"} 1"));
@@ -3508,6 +3576,7 @@ mod tests {
         assert!(output.contains("# TYPE telemt_auth_budget_exhausted_total counter"));
         assert!(output.contains("# TYPE telemt_upstream_connect_attempt_total counter"));
         assert!(output.contains("# TYPE telemt_me_rpc_proxy_req_signal_sent_total counter"));
+        assert!(output.contains("# TYPE telemt_me_rpc_proxy_req_signal_timeout_total counter"));
         assert!(output.contains("# TYPE telemt_me_idle_close_by_peer_total counter"));
         assert!(output.contains("# TYPE telemt_relay_idle_soft_mark_total counter"));
         assert!(output.contains("# TYPE telemt_relay_idle_hard_close_total counter"));

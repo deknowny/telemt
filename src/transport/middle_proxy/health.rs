@@ -44,9 +44,11 @@ struct DcFloorPlanEntry {
     dc: i32,
     endpoints: Vec<SocketAddr>,
     alive: usize,
+    base_required: usize,
     min_required: usize,
     target_required: usize,
     max_required: usize,
+    bound_clients: usize,
     has_bound_clients: bool,
     floor_capped: bool,
 }
@@ -888,12 +890,11 @@ fn adaptive_floor_class_min(
     base_required: usize,
 ) -> usize {
     if endpoint_count <= 1 {
-        let min_single = (pool
-            .floor_runtime
-            .me_adaptive_floor_min_writers_single_endpoint
-            .load(std::sync::atomic::Ordering::Relaxed) as usize)
-            .max(1);
-        min_single.min(base_required.max(1))
+        // A single Telegram endpoint has no alternate address to absorb a
+        // writer flap. Keep the base shadow floor even while the DC looks idle;
+        // otherwise health drains to one writer and immediately has to rebuild
+        // the floor when traffic resumes, creating availability churn.
+        base_required.max(1)
     } else {
         pool.adaptive_floor_min_writers_multi_endpoint()
             .min(base_required.max(1))
@@ -912,6 +913,16 @@ fn adaptive_floor_class_max(
         pool.adaptive_floor_max_extra_multi_per_core()
     };
     base_required.saturating_add(cpu_cores.saturating_mul(extra_per_core))
+}
+
+fn adaptive_floor_load_required(bound_clients: usize) -> usize {
+    const TARGET_CLIENTS_PER_WRITER: usize = 64;
+
+    if bound_clients == 0 {
+        0
+    } else {
+        bound_clients.saturating_add(TARGET_CLIENTS_PER_WRITER - 1) / TARGET_CLIENTS_PER_WRITER
+    }
 }
 
 fn list_writer_ids_for_endpoints(
@@ -976,14 +987,18 @@ async fn build_family_floor_plan(
             .sum::<usize>();
         family_active_total = family_active_total.saturating_add(alive);
         let writer_ids = list_writer_ids_for_endpoints(*dc, endpoints, live_writer_ids_by_addr);
-        let has_bound_clients = has_bound_clients_on_endpoint(&writer_ids, bound_clients_by_writer);
+        let bound_clients = writer_ids
+            .iter()
+            .map(|writer_id| bound_clients_by_writer.get(writer_id).copied().unwrap_or(0))
+            .sum::<usize>();
+        let has_bound_clients = bound_clients > 0;
         // Idle adaptive DCs keep quorum coverage instead of expanding to every
         // advertised endpoint. This prevents health checks from turning a large
         // Telegram proxy-config snapshot into an unbounded writer fanout.
         let desired_raw = if is_adaptive && !has_bound_clients {
             min_required
         } else {
-            base_required
+            base_required.max(adaptive_floor_load_required(bound_clients))
         };
         let target_required = desired_raw.clamp(min_required, max_required);
 
@@ -991,9 +1006,11 @@ async fn build_family_floor_plan(
             dc: *dc,
             endpoints: endpoints.clone(),
             alive,
+            base_required,
             min_required,
             target_required,
             max_required,
+            bound_clients,
             has_bound_clients,
             floor_capped: false,
         });
@@ -1080,6 +1097,18 @@ async fn build_family_floor_plan(
     }
 
     for entry in entries {
+        if entry.target_required > entry.base_required {
+            debug!(
+                dc = %entry.dc,
+                ?family,
+                alive = entry.alive,
+                bound_clients = entry.bound_clients,
+                base_required = entry.base_required,
+                target_required = entry.target_required,
+                max_required = entry.max_required,
+                "ME adaptive floor expanded for active client load"
+            );
+        }
         by_dc.insert(entry.dc, entry);
     }
     let active_cap_effective_total =
@@ -1364,17 +1393,9 @@ async fn maybe_refresh_idle_writer_for_dc(
 
 fn idle_writer_pre_refresh_enabled(pool: &MePool) -> bool {
     // ME keepalive already refreshes idle upstream sessions without replacing
-    // writers. Running both mechanisms creates avoidable connect/handshake churn.
+    // writers. Running both mechanisms creates avoidable churn and can sever
+    // quiet client sessions that are still bound to a writer.
     !pool.writer_lifecycle.me_keepalive_enabled
-}
-
-fn has_bound_clients_on_endpoint(
-    writer_ids: &[u64],
-    bound_clients_by_writer: &HashMap<u64, usize>,
-) -> bool {
-    writer_ids
-        .iter()
-        .any(|writer_id| bound_clients_by_writer.get(writer_id).copied().unwrap_or(0) > 0)
 }
 
 async fn recover_single_endpoint_outage(
@@ -1793,8 +1814,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        build_family_floor_plan, drain_excess_idle_writers_for_dc,
-        idle_writer_pre_refresh_enabled, reap_draining_writers,
+        build_family_floor_plan, drain_excess_idle_writers_for_dc, idle_writer_pre_refresh_enabled,
+        reap_draining_writers,
     };
     use crate::config::{GeneralConfig, MeRouteNoWriterMode, MeSocksKdfPolicy, MeWriterPickMode};
     use crate::crypto::SecureRandom;
@@ -1907,13 +1928,6 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn idle_writer_pre_refresh_is_disabled_when_keepalive_is_enabled() {
-        let pool = make_pool(0).await;
-
-        assert!(!idle_writer_pre_refresh_enabled(&pool));
-    }
-
     async fn insert_draining_writer(
         pool: &Arc<MePool>,
         writer_id: u64,
@@ -1991,6 +2005,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_writer_pre_refresh_is_disabled_when_keepalive_is_enabled() {
+        let pool = make_pool(0).await;
+
+        assert!(!idle_writer_pre_refresh_enabled(&pool));
+    }
+
+    #[tokio::test]
+    async fn adaptive_floor_single_endpoint_keeps_shadow_floor_when_idle() {
+        let pool = make_pool(0).await;
+        let endpoints = vec![SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            443,
+        )];
+        let dc_endpoints = HashMap::from([(2, endpoints)]);
+        let live_addr_counts = HashMap::new();
+        let live_writer_ids_by_addr = HashMap::new();
+        let bound_clients_by_writer = HashMap::new();
+
+        let plan = build_family_floor_plan(
+            &pool,
+            IpFamily::V4,
+            &dc_endpoints,
+            &live_addr_counts,
+            &live_writer_ids_by_addr,
+            &bound_clients_by_writer,
+        )
+        .await;
+
+        let entry = plan.by_dc.get(&2).expect("dc floor entry");
+        assert_eq!(entry.min_required, 3);
+        assert_eq!(entry.target_required, 3);
+        assert_eq!(plan.target_writers_total, 3);
+    }
+
+    #[tokio::test]
     async fn adaptive_floor_idle_dc_uses_minimum_target_not_endpoint_fanout() {
         let pool = make_pool(0).await;
         let endpoints = vec![
@@ -2063,10 +2112,7 @@ mod tests {
         pool.registry.mark_writer_idle(3).await;
 
         let writers = pool.writers.read().await;
-        let endpoints = writers
-            .iter()
-            .map(|writer| writer.addr)
-            .collect::<Vec<_>>();
+        let endpoints = writers.iter().map(|writer| writer.addr).collect::<Vec<_>>();
         let live_writer_ids_by_addr = writers
             .iter()
             .map(|writer| ((writer.writer_dc, writer.addr), vec![writer.id]))

@@ -73,7 +73,8 @@ impl MePool {
         self.floor_runtime
             .me_adaptive_floor_warm_writers_current
             .store(warm as u64, Ordering::Relaxed);
-        self.stats.set_me_writers_active_current_gauge(active as u64);
+        self.stats
+            .set_me_writers_active_current_gauge(active as u64);
         self.stats.set_me_writers_warm_current_gauge(warm as u64);
     }
 
@@ -327,7 +328,8 @@ impl MePool {
                         self.floor_runtime
                             .me_adaptive_floor_warm_writers_current
                             .store(warm as u64, Ordering::Relaxed);
-                        self.stats.set_me_writers_active_current_gauge(active as u64);
+                        self.stats
+                            .set_me_writers_active_current_gauge(active as u64);
                         self.stats.set_me_writers_warm_current_gauge(warm as u64);
                     }
                     debug!(

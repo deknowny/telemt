@@ -52,8 +52,10 @@ use crate::protocol::constants::{
 const TLS_HEADER_SIZE: usize = 5;
 
 /// Maximum TLS fragment size we emit for Application Data.
-/// Real TLS 1.3 allows up to 16384 + 256 bytes of ciphertext (incl. tag).
-const MAX_TLS_PAYLOAD: usize = MAX_TLS_CIPHERTEXT_SIZE;
+/// FakeTLS writes plaintext bytes directly inside the record, so emitted
+/// records must stay at the plaintext fragment limit. The reader remains
+/// tolerant of larger ciphertext-sized records from real clients.
+const MAX_TLS_PAYLOAD: usize = MAX_TLS_PLAINTEXT_SIZE;
 
 /// Maximum pending write buffer for one record remainder.
 /// Note: we never queue unlimited amount of data here; state holds at most one record.
@@ -924,7 +926,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for FakeTlsWriter<W> {
 impl<W: AsyncWrite + Unpin> FakeTlsWriter<W> {
     /// Write all data wrapped in TLS records.
     ///
-    /// Convenience method that chunks into <= MAX_TLS_CIPHERTEXT_SIZE records.
+    /// Convenience method that chunks into <= MAX_TLS_PLAINTEXT_SIZE records.
     pub async fn write_all_tls(&mut self, data: &[u8]) -> Result<()> {
         let mut written = 0;
         while written < data.len() {
