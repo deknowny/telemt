@@ -649,6 +649,26 @@ pub(crate) fn default_mask_relay_idle_timeout_ms() -> u64 {
     100
 }
 
+#[cfg(not(test))]
+pub(crate) fn default_mask_tcp_global_concurrency() -> usize {
+    1024
+}
+
+#[cfg(test)]
+pub(crate) fn default_mask_tcp_global_concurrency() -> usize {
+    1024
+}
+
+#[cfg(not(test))]
+pub(crate) fn default_mask_tcp_per_peer_concurrency() -> usize {
+    32
+}
+
+#[cfg(test)]
+pub(crate) fn default_mask_tcp_per_peer_concurrency() -> usize {
+    1024
+}
+
 pub(crate) fn default_mask_classifier_prefetch_timeout_ms() -> u64 {
     5
 }

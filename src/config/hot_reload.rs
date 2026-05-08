@@ -638,6 +638,9 @@ fn warn_non_hot_changes(old: &ProxyConfig, new: &ProxyConfig, non_hot_changed: b
         || old.censorship.mask_relay_max_bytes != new.censorship.mask_relay_max_bytes
         || old.censorship.mask_relay_timeout_ms != new.censorship.mask_relay_timeout_ms
         || old.censorship.mask_relay_idle_timeout_ms != new.censorship.mask_relay_idle_timeout_ms
+        || old.censorship.mask_tcp_global_concurrency != new.censorship.mask_tcp_global_concurrency
+        || old.censorship.mask_tcp_per_peer_concurrency
+            != new.censorship.mask_tcp_per_peer_concurrency
         || old.censorship.mask_classifier_prefetch_timeout_ms
             != new.censorship.mask_classifier_prefetch_timeout_ms
         || old.censorship.mask_timing_normalization_enabled

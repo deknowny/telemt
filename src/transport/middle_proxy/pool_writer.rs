@@ -47,6 +47,25 @@ enum WriterLifecycleExit {
     Cancelled,
 }
 
+fn writer_lifecycle_removal_reason(
+    exit: &WriterLifecycleExit,
+    idle_close_by_peer: bool,
+) -> &'static str {
+    match exit {
+        WriterLifecycleExit::Reader(Ok(())) => "reader_eof",
+        WriterLifecycleExit::Reader(Err(_)) if idle_close_by_peer => "reader_idle_peer_close",
+        WriterLifecycleExit::Reader(Err(error)) if is_me_peer_closed_error(error) => {
+            "reader_peer_closed"
+        }
+        WriterLifecycleExit::Reader(Err(_)) => "reader_error",
+        WriterLifecycleExit::Writer(Ok(())) => "writer_loop_closed",
+        WriterLifecycleExit::Writer(Err(_)) => "writer_loop_error",
+        WriterLifecycleExit::Ping => "ping_loop_finished",
+        WriterLifecycleExit::Signal => "signal_loop_finished",
+        WriterLifecycleExit::Cancelled => "cancelled",
+    }
+}
+
 async fn writer_command_loop(
     mut rx: mpsc::Receiver<WriterCommand>,
     mut rpc_writer: RpcWriter,
@@ -318,7 +337,9 @@ impl MePool {
         }
 
         for writer_id in closed_writer_ids {
-            let _ = self.remove_writer_and_close_clients(writer_id).await;
+            let _ = self
+                .remove_writer_and_close_clients_with_reason(writer_id, "prune_closed")
+                .await;
         }
     }
 
@@ -551,13 +572,15 @@ impl MePool {
                 _ = cancel_select.cancelled() => WriterLifecycleExit::Cancelled,
             };
 
+            let idle_close_by_peer = if let WriterLifecycleExit::Reader(Err(error)) = &exit {
+                is_me_peer_closed_error(error) && reg.is_writer_empty(writer_id).await
+            } else {
+                false
+            };
+            let removal_reason = writer_lifecycle_removal_reason(&exit, idle_close_by_peer);
+
             match exit {
                 WriterLifecycleExit::Reader(res) => {
-                    let idle_close_by_peer = if let Err(e) = res.as_ref() {
-                        is_me_peer_closed_error(e) && reg.is_writer_empty(writer_id).await
-                    } else {
-                        false
-                    };
                     if idle_close_by_peer {
                         stats_reader_close.increment_me_idle_close_by_peer_total();
                         let writer_idle_secs = reg
@@ -595,7 +618,8 @@ impl MePool {
             }
 
             if let Some(pool) = pool_lifecycle.upgrade() {
-                pool.remove_writer_and_close_clients(writer_id).await;
+                pool.remove_writer_and_close_clients_with_reason(writer_id, removal_reason)
+                    .await;
             } else {
                 // Fallback for shutdown races: make lifecycle exit observable by prune.
                 cancel_cleanup.cancel();
@@ -608,23 +632,36 @@ impl MePool {
         Ok(())
     }
 
-    pub(crate) async fn remove_writer_and_close_clients(self: &Arc<Self>, writer_id: u64) {
-        let _ = self
-            .remove_writer_with_mode(writer_id, WriterTeardownMode::Any)
-            .await;
+    #[allow(dead_code)]
+    pub(crate) async fn remove_writer_and_close_clients(self: &Arc<Self>, writer_id: u64) -> bool {
+        self.remove_writer_and_close_clients_with_reason(writer_id, "unspecified")
+            .await
+    }
+
+    pub(crate) async fn remove_writer_and_close_clients_with_reason(
+        self: &Arc<Self>,
+        writer_id: u64,
+        reason: &'static str,
+    ) -> bool {
+        self.remove_writer_with_mode(writer_id, WriterTeardownMode::Any, reason)
+            .await
     }
 
     pub(super) async fn remove_draining_writer_hard_detach(
         self: &Arc<Self>,
         writer_id: u64,
     ) -> bool {
-        self.remove_writer_with_mode(writer_id, WriterTeardownMode::DrainingOnly)
-            .await
+        self.remove_writer_with_mode(
+            writer_id,
+            WriterTeardownMode::DrainingOnly,
+            "draining_watchdog_hard_detach",
+        )
+        .await
     }
 
     #[allow(dead_code)]
     async fn remove_writer_only(self: &Arc<Self>, writer_id: u64) -> bool {
-        self.remove_writer_with_mode(writer_id, WriterTeardownMode::Any)
+        self.remove_writer_with_mode(writer_id, WriterTeardownMode::Any, "remove_writer_only")
             .await
     }
 
@@ -638,11 +675,13 @@ impl MePool {
         self: &Arc<Self>,
         writer_id: u64,
         mode: WriterTeardownMode,
+        reason: &'static str,
     ) -> bool {
         let mut close_tx: Option<mpsc::Sender<WriterCommand>> = None;
         let mut removed_addr: Option<SocketAddr> = None;
         let mut removed_dc: Option<i32> = None;
         let mut removed_uptime: Option<Duration> = None;
+        let mut removed_was_draining = false;
         let mut trigger_refill = false;
         let mut removed = false;
         {
@@ -660,10 +699,12 @@ impl MePool {
                     self.decrement_draining_active_runtime();
                 }
                 self.stats.increment_me_writer_removed_total();
+                self.stats.increment_me_writer_removed_reason_total(reason);
                 w.cancel.cancel();
                 removed_addr = Some(w.addr);
                 removed_dc = Some(w.writer_dc);
                 removed_uptime = Some(w.created_at.elapsed());
+                removed_was_draining = was_draining;
                 trigger_refill = !was_draining;
                 if trigger_refill {
                     self.stats.increment_me_writer_removed_unexpected_total();
@@ -680,6 +721,7 @@ impl MePool {
         //   existing MTProto client stream onto a fresh ME writer loses the
         //   upstream TCP/session state and shows up as client crypto desync.
         let lost_clients = self.registry.writer_lost(writer_id).await;
+        let lost_clients_count = lost_clients.len();
         for bound in lost_clients {
             let _ = self
                 .registry
@@ -694,6 +736,29 @@ impl MePool {
         }
         if let Some(addr) = removed_addr {
             if let Some(uptime) = removed_uptime {
+                let writer_dc = removed_dc.unwrap_or_default();
+                if trigger_refill {
+                    warn!(
+                        writer_id,
+                        reason,
+                        %addr,
+                        writer_dc,
+                        uptime_ms = uptime.as_millis(),
+                        lost_clients_count,
+                        "ME writer removed unexpectedly"
+                    );
+                } else {
+                    debug!(
+                        writer_id,
+                        reason,
+                        %addr,
+                        writer_dc,
+                        uptime_ms = uptime.as_millis(),
+                        lost_clients_count,
+                        was_draining = removed_was_draining,
+                        "ME writer removed"
+                    );
+                }
                 // Quarantine contract: only unexpected removals are considered endpoint flap.
                 if trigger_refill {
                     self.stats
@@ -771,6 +836,9 @@ impl MePool {
     }
 
     pub(super) fn writer_accepts_new_binding(&self, writer: &MeWriter) -> bool {
+        if writer.tx.is_closed() {
+            return false;
+        }
         if !writer.draining.load(Ordering::Relaxed) {
             return true;
         }

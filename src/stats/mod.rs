@@ -267,6 +267,8 @@ pub struct Stats {
     pool_stale_pick_total: AtomicU64,
     me_writer_removed_total: AtomicU64,
     me_writer_removed_unexpected_total: AtomicU64,
+    me_writer_removed_reason_total: DashMap<&'static str, AtomicU64>,
+    me_bind_commit_miss_total: DashMap<&'static str, AtomicU64>,
     me_refill_triggered_total: AtomicU64,
     me_refill_skipped_inflight_total: AtomicU64,
     me_refill_failed_total: AtomicU64,
@@ -1394,6 +1396,22 @@ impl Stats {
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
+    pub fn increment_me_writer_removed_reason_total(&self, reason: &'static str) {
+        if self.telemetry_me_allows_normal() {
+            self.me_writer_removed_reason_total
+                .entry(reason)
+                .or_insert_with(|| AtomicU64::new(0))
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_bind_commit_miss_total(&self, reason: &'static str) {
+        if self.telemetry_me_allows_normal() {
+            self.me_bind_commit_miss_total
+                .entry(reason)
+                .or_insert_with(|| AtomicU64::new(0))
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     pub fn increment_me_refill_triggered_total(&self) {
         if self.telemetry_me_allows_debug() {
             self.me_refill_triggered_total
@@ -2279,6 +2297,24 @@ impl Stats {
     pub fn get_me_writer_removed_unexpected_total(&self) -> u64 {
         self.me_writer_removed_unexpected_total
             .load(Ordering::Relaxed)
+    }
+    pub fn get_me_writer_removed_reason_counts(&self) -> Vec<(&'static str, u64)> {
+        let mut values = self
+            .me_writer_removed_reason_total
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().load(Ordering::Relaxed)))
+            .collect::<Vec<_>>();
+        values.sort_by_key(|(reason, _)| *reason);
+        values
+    }
+    pub fn get_me_bind_commit_miss_counts(&self) -> Vec<(&'static str, u64)> {
+        let mut values = self
+            .me_bind_commit_miss_total
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().load(Ordering::Relaxed)))
+            .collect::<Vec<_>>();
+        values.sort_by_key(|(reason, _)| *reason);
+        values
     }
     pub fn get_me_refill_triggered_total(&self) -> u64 {
         self.me_refill_triggered_total.load(Ordering::Relaxed)

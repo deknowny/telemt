@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::ProxyConfig;
 use crate::ip_tracker::UserIpTracker;
+use crate::proxy::masking;
 use crate::proxy::shared_state::ProxySharedState;
 use crate::stats::Stats;
 use crate::stats::beobachten::BeobachtenStore;
@@ -468,6 +469,34 @@ async fn render_metrics(
             0
         }
     );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_mask_events_total FakeTLS/masking path events by outcome"
+    );
+    let _ = writeln!(out, "# TYPE telemt_mask_events_total counter");
+    for (event, count) in masking::mask_event_counts_for_metrics() {
+        let _ = writeln!(
+            out,
+            "telemt_mask_events_total{{event=\"{}\"}} {}",
+            event.replace('\\', "\\\\").replace('"', "\\\""),
+            if core_enabled { count } else { 0 }
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_mask_active_current FakeTLS/masking path active TCP sessions by state"
+    );
+    let _ = writeln!(out, "# TYPE telemt_mask_active_current gauge");
+    for (state, count) in masking::mask_active_counts_for_metrics() {
+        let _ = writeln!(
+            out,
+            "telemt_mask_active_current{{state=\"{}\"}} {}",
+            state.replace('\\', "\\\\").replace('"', "\\\""),
+            if core_enabled { count } else { 0 }
+        );
+    }
 
     let _ = writeln!(
         out,
@@ -2918,6 +2947,36 @@ async fn render_metrics(
             0
         }
     );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_writer_removed_reason_total ME writer removals by teardown reason"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_writer_removed_reason_total counter");
+    if me_allows_normal {
+        for (reason, count) in stats.get_me_writer_removed_reason_counts() {
+            let _ = writeln!(
+                out,
+                "telemt_me_writer_removed_reason_total{{reason=\"{}\"}} {}",
+                reason, count
+            );
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_bind_commit_miss_total ME bind attempts skipped before commit by reason"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_bind_commit_miss_total counter");
+    if me_allows_normal {
+        for (reason, count) in stats.get_me_bind_commit_miss_counts() {
+            let _ = writeln!(
+                out,
+                "telemt_me_bind_commit_miss_total{{reason=\"{}\"}} {}",
+                reason, count
+            );
+        }
+    }
 
     let _ = writeln!(
         out,

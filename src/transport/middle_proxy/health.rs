@@ -22,10 +22,11 @@ const JITTER_FRAC_NUM: u64 = 2; // jitter up to 50% of backoff
 #[allow(dead_code)]
 const MAX_CONCURRENT_PER_DC_DEFAULT: usize = 1;
 const SHADOW_ROTATE_RETRY_SECS: u64 = 30;
-const IDLE_REFRESH_TRIGGER_BASE_SECS: u64 = 45;
-const IDLE_REFRESH_TRIGGER_JITTER_SECS: u64 = 5;
+const IDLE_REFRESH_TRIGGER_BASE_SECS: u64 = 30;
+const IDLE_REFRESH_TRIGGER_JITTER_SECS: u64 = 15;
 const IDLE_REFRESH_RETRY_SECS: u64 = 8;
-const IDLE_REFRESH_SUCCESS_GUARD_SECS: u64 = 5;
+const IDLE_REFRESH_SUCCESS_GUARD_SECS: u64 = 1;
+const IDLE_REFRESH_MAX_PER_CYCLE: usize = 2;
 const HEALTH_RECONNECT_BUDGET_PER_CORE: usize = 2;
 const HEALTH_RECONNECT_BUDGET_PER_DC: usize = 1;
 const HEALTH_RECONNECT_BUDGET_MIN: usize = 4;
@@ -65,6 +66,12 @@ struct FamilyFloorPlan {
     target_writers_total: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AdaptiveFloorTargetHold {
+    target_required: usize,
+    expires_at: Instant,
+}
+
 #[derive(Debug)]
 struct FamilyReconnectOutcome {
     key: (i32, IpFamily),
@@ -84,6 +91,8 @@ pub async fn me_health_monitor(pool: Arc<MePool>, rng: Arc<SecureRandom>, _min_c
     let mut shadow_rotate_deadline: HashMap<(i32, IpFamily), Instant> = HashMap::new();
     let mut idle_refresh_next_attempt: HashMap<(i32, IpFamily), Instant> = HashMap::new();
     let mut floor_warn_next_allowed: HashMap<(i32, IpFamily), Instant> = HashMap::new();
+    let mut adaptive_floor_target_hold: HashMap<(i32, IpFamily), AdaptiveFloorTargetHold> =
+        HashMap::new();
     let mut drain_warn_next_allowed: HashMap<u64, Instant> = HashMap::new();
     let mut degraded_interval = true;
     loop {
@@ -109,6 +118,7 @@ pub async fn me_health_monitor(pool: Arc<MePool>, rng: Arc<SecureRandom>, _min_c
             &mut shadow_rotate_deadline,
             &mut idle_refresh_next_attempt,
             &mut floor_warn_next_allowed,
+            &mut adaptive_floor_target_hold,
         )
         .await;
         let v6_degraded = check_family(
@@ -124,6 +134,7 @@ pub async fn me_health_monitor(pool: Arc<MePool>, rng: Arc<SecureRandom>, _min_c
             &mut shadow_rotate_deadline,
             &mut idle_refresh_next_attempt,
             &mut floor_warn_next_allowed,
+            &mut adaptive_floor_target_hold,
         )
         .await;
         update_family_runtime_state(&pool, IpFamily::V4, v4_degraded);
@@ -268,7 +279,8 @@ pub(super) async fn reap_draining_writers(
             continue;
         }
         pool.stats.increment_pool_force_close_total();
-        pool.remove_writer_and_close_clients(writer_id).await;
+        pool.remove_writer_and_close_clients_with_reason(writer_id, "drain_timeout_force_close")
+            .await;
         closed_total = closed_total.saturating_add(1);
     }
     for writer_id in empty_writer_ids {
@@ -278,7 +290,8 @@ pub(super) async fn reap_draining_writers(
         if !closed_writer_ids.insert(writer_id) {
             continue;
         }
-        pool.remove_writer_and_close_clients(writer_id).await;
+        pool.remove_writer_and_close_clients_with_reason(writer_id, "drain_empty_close")
+            .await;
         closed_total = closed_total.saturating_add(1);
     }
 
@@ -356,6 +369,7 @@ async fn check_family(
     shadow_rotate_deadline: &mut HashMap<(i32, IpFamily), Instant>,
     idle_refresh_next_attempt: &mut HashMap<(i32, IpFamily), Instant>,
     floor_warn_next_allowed: &mut HashMap<(i32, IpFamily), Instant>,
+    adaptive_floor_target_hold: &mut HashMap<(i32, IpFamily), AdaptiveFloorTargetHold>,
 ) -> bool {
     let enabled = match family {
         IpFamily::V4 => pool.decision.ipv4_me,
@@ -425,6 +439,7 @@ async fn check_family(
         &live_addr_counts,
         &live_writer_ids_by_addr,
         &bound_clients_by_writer,
+        adaptive_floor_target_hold,
     )
     .await;
     pool.set_adaptive_floor_runtime_caps(
@@ -458,13 +473,14 @@ async fn check_family(
             .map(|addr| *live_addr_counts.get(&(dc, *addr)).unwrap_or(&0))
             .sum::<usize>();
 
-        if endpoints.len() == 1 && pool.single_endpoint_outage_mode_enabled() && alive == 0 {
+        if endpoints.len() == 1 && pool.single_endpoint_outage_mode_enabled() && alive < required {
             family_degraded = true;
             if single_endpoint_outage.insert(key) {
                 pool.stats.increment_me_single_endpoint_outage_enter_total();
                 warn!(
                     dc = %dc,
                     ?family,
+                    alive,
                     required,
                     endpoint_count = endpoints.len(),
                     "Single-endpoint DC outage detected"
@@ -476,6 +492,7 @@ async fn check_family(
                 rng,
                 key,
                 endpoints[0],
+                alive,
                 required,
                 outage_backoff,
                 outage_next_attempt,
@@ -946,13 +963,21 @@ async fn build_family_floor_plan(
     live_addr_counts: &HashMap<(i32, SocketAddr), usize>,
     live_writer_ids_by_addr: &HashMap<(i32, SocketAddr), Vec<u64>>,
     bound_clients_by_writer: &HashMap<u64, usize>,
+    adaptive_floor_target_hold: &mut HashMap<(i32, IpFamily), AdaptiveFloorTargetHold>,
 ) -> FamilyFloorPlan {
     let mut entries = Vec::<DcFloorPlanEntry>::new();
     let mut by_dc = HashMap::<i32, DcFloorPlanEntry>::new();
     let mut family_active_total = 0usize;
+    let mut active_dc_keys = HashSet::<i32>::new();
 
     let floor_mode = pool.floor_mode();
     let is_adaptive = floor_mode == MeFloorMode::Adaptive;
+    let now = Instant::now();
+    let target_hold_grace = Duration::from_secs(
+        pool.floor_runtime
+            .me_adaptive_floor_recover_grace_secs
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
     let cpu_cores = pool.adaptive_floor_effective_cpu_cores().max(1);
     let (active_writers_current, warm_writers_current, _) =
         pool.non_draining_writer_counts_by_contour().await;
@@ -961,6 +986,7 @@ async fn build_family_floor_plan(
         if endpoints.is_empty() {
             continue;
         }
+        active_dc_keys.insert(*dc);
         let _key = (*dc, family);
         let base_required = pool.required_writers_for_dc(endpoints.len()).max(1);
         let min_required = if is_adaptive {
@@ -1000,7 +1026,20 @@ async fn build_family_floor_plan(
         } else {
             base_required.max(adaptive_floor_load_required(bound_clients))
         };
-        let target_required = desired_raw.clamp(min_required, max_required);
+        let mut target_required = desired_raw.clamp(min_required, max_required);
+
+        if is_adaptive && !target_hold_grace.is_zero() {
+            target_required = apply_adaptive_floor_target_hold(
+                adaptive_floor_target_hold,
+                family,
+                *dc,
+                target_required,
+                min_required,
+                max_required,
+                now,
+                target_hold_grace,
+            );
+        }
 
         entries.push(DcFloorPlanEntry {
             dc: *dc,
@@ -1015,6 +1054,10 @@ async fn build_family_floor_plan(
             floor_capped: false,
         });
     }
+
+    adaptive_floor_target_hold.retain(|(dc, held_family), hold| {
+        *held_family != family || (active_dc_keys.contains(dc) && hold.expires_at > now)
+    });
 
     if entries.is_empty() {
         let active_cap_configured_total = pool.adaptive_floor_active_cap_configured_total();
@@ -1123,6 +1166,54 @@ async fn build_family_floor_plan(
         active_writers_current,
         warm_writers_current,
         target_writers_total,
+    }
+}
+
+fn apply_adaptive_floor_target_hold(
+    adaptive_floor_target_hold: &mut HashMap<(i32, IpFamily), AdaptiveFloorTargetHold>,
+    family: IpFamily,
+    dc: i32,
+    target_required: usize,
+    min_required: usize,
+    max_required: usize,
+    now: Instant,
+    target_hold_grace: Duration,
+) -> usize {
+    let key = (dc, family);
+    let next_expires_at = now + target_hold_grace;
+
+    let Some(held) = adaptive_floor_target_hold.get_mut(&key) else {
+        adaptive_floor_target_hold.insert(
+            key,
+            AdaptiveFloorTargetHold {
+                target_required,
+                expires_at: next_expires_at,
+            },
+        );
+        return target_required;
+    };
+
+    if target_required >= held.target_required || held.expires_at <= now {
+        held.target_required = target_required;
+        held.expires_at = next_expires_at;
+        return target_required;
+    }
+
+    let held_target = held.target_required.clamp(min_required, max_required);
+    if held_target > target_required {
+        debug!(
+            dc = %dc,
+            ?family,
+            computed_target = target_required,
+            held_target,
+            min_required,
+            max_required,
+            grace_left_ms = held.expires_at.saturating_duration_since(now).as_millis(),
+            "ME adaptive floor held target during recovery grace"
+        );
+        held_target
+    } else {
+        target_required
     }
 }
 
@@ -1289,6 +1380,14 @@ async fn maybe_refresh_idle_writer_for_dc(
         return;
     }
 
+    // Single-endpoint DCs are fragile under sustained load: every proactive
+    // rotate creates extra TCP churn against the same Telegram address. Let
+    // keepalive and passive replacement handle idle closes there; health will
+    // still refill immediately if the floor drops.
+    if endpoints.len() <= 1 {
+        return;
+    }
+
     if alive < required {
         return;
     }
@@ -1301,7 +1400,7 @@ async fn maybe_refresh_idle_writer_for_dc(
     }
 
     let now_epoch_secs = MePool::now_epoch_secs();
-    let mut candidate: Option<(u64, SocketAddr, u64, u64)> = None;
+    let mut candidates: Vec<(u64, SocketAddr, u64, u64)> = Vec::new();
     for endpoint in endpoints {
         let Some(writer_ids) = live_writer_ids_by_addr.get(&(dc, *endpoint)) else {
             continue;
@@ -1319,83 +1418,93 @@ async fn maybe_refresh_idle_writer_for_dc(
             if idle_age_secs < threshold_secs {
                 continue;
             }
-            if candidate
-                .as_ref()
-                .map(|(_, _, age, _)| idle_age_secs > *age)
-                .unwrap_or(true)
-            {
-                candidate = Some((*writer_id, *endpoint, idle_age_secs, threshold_secs));
-            }
+            candidates.push((*writer_id, *endpoint, idle_age_secs, threshold_secs));
         }
     }
 
-    let Some((old_writer_id, endpoint, idle_age_secs, threshold_secs)) = candidate else {
+    if candidates.is_empty() {
         return;
-    };
+    }
 
-    let rotate_ok = match tokio::time::timeout(
-        pool.reconnect_runtime.me_one_timeout,
-        pool.connect_one_for_dc(endpoint, dc, rng.as_ref()),
-    )
-    .await
+    candidates.sort_by_key(|(_, _, idle_age_secs, _)| std::cmp::Reverse(*idle_age_secs));
+
+    let mut refreshed = 0usize;
+    for (old_writer_id, endpoint, idle_age_secs, threshold_secs) in
+        candidates.into_iter().take(IDLE_REFRESH_MAX_PER_CYCLE)
     {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            debug!(
-                dc = %dc,
-                ?family,
-                %endpoint,
-                old_writer_id,
-                idle_age_secs,
-                threshold_secs,
-                %error,
-                "Idle writer pre-refresh connect failed"
-            );
-            false
-        }
-        Err(_) => {
-            debug!(
-                dc = %dc,
-                ?family,
-                %endpoint,
-                old_writer_id,
-                idle_age_secs,
-                threshold_secs,
-                "Idle writer pre-refresh connect timed out"
-            );
-            false
-        }
-    };
+        let rotate_ok = match tokio::time::timeout(
+            pool.reconnect_runtime.me_one_timeout,
+            pool.connect_one_for_dc(endpoint, dc, rng.as_ref()),
+        )
+        .await
+        {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                debug!(
+                    dc = %dc,
+                    ?family,
+                    %endpoint,
+                    old_writer_id,
+                    idle_age_secs,
+                    threshold_secs,
+                    %error,
+                    "Idle writer pre-refresh connect failed"
+                );
+                false
+            }
+            Err(_) => {
+                debug!(
+                    dc = %dc,
+                    ?family,
+                    %endpoint,
+                    old_writer_id,
+                    idle_age_secs,
+                    threshold_secs,
+                    "Idle writer pre-refresh connect timed out"
+                );
+                false
+            }
+        };
 
-    if !rotate_ok {
-        idle_refresh_next_attempt.insert(key, now + Duration::from_secs(IDLE_REFRESH_RETRY_SECS));
+        if !rotate_ok {
+            idle_refresh_next_attempt
+                .insert(key, now + Duration::from_secs(IDLE_REFRESH_RETRY_SECS));
+            return;
+        }
+
+        pool.mark_writer_draining_with_timeout(old_writer_id, pool.force_close_timeout(), false)
+            .await;
+        refreshed += 1;
+        info!(
+            dc = %dc,
+            ?family,
+            %endpoint,
+            old_writer_id,
+            idle_age_secs,
+            threshold_secs,
+            alive,
+            required,
+            refreshed,
+            max_per_cycle = IDLE_REFRESH_MAX_PER_CYCLE,
+            "Idle writer refreshed before upstream idle timeout"
+        );
+    }
+
+    if refreshed == 0 {
         return;
     }
 
-    pool.mark_writer_draining_with_timeout(old_writer_id, pool.force_close_timeout(), false)
-        .await;
     idle_refresh_next_attempt.insert(
         key,
         now + Duration::from_secs(IDLE_REFRESH_SUCCESS_GUARD_SECS),
     );
-    info!(
-        dc = %dc,
-        ?family,
-        %endpoint,
-        old_writer_id,
-        idle_age_secs,
-        threshold_secs,
-        alive,
-        required,
-        "Idle writer refreshed before upstream idle timeout"
-    );
 }
 
 fn idle_writer_pre_refresh_enabled(pool: &MePool) -> bool {
-    // ME keepalive already refreshes idle upstream sessions without replacing
-    // writers. Running both mechanisms creates avoidable churn and can sever
-    // quiet client sessions that are still bound to a writer.
-    !pool.writer_lifecycle.me_keepalive_enabled
+    // Telegram may still close empty ME writers at about 90s even when
+    // RPC_PING/RPC_PONG keepalive succeeds. Pre-refresh only rotates writers
+    // with no bound clients, so it can safely run alongside keepalive.
+    pool.writer_lifecycle.me_keepalive_enabled
 }
 
 async fn recover_single_endpoint_outage(
@@ -1403,6 +1512,7 @@ async fn recover_single_endpoint_outage(
     rng: &Arc<SecureRandom>,
     key: (i32, IpFamily),
     endpoint: SocketAddr,
+    alive: usize,
     required: usize,
     outage_backoff: &mut HashMap<(i32, IpFamily), u64>,
     outage_next_attempt: &mut HashMap<(i32, IpFamily), Instant>,
@@ -1416,88 +1526,103 @@ async fn recover_single_endpoint_outage(
     }
 
     let (min_backoff_ms, max_backoff_ms) = pool.single_endpoint_outage_backoff_bounds_ms();
-    if reconnect_sem.available_permits() == 0 {
+    let missing = required.saturating_sub(alive).max(1);
+    let max_attempts = pool
+        .reconnect_runtime
+        .me_reconnect_max_concurrent_per_dc
+        .max(1) as usize;
+    let attempts = missing
+        .min(max_attempts)
+        .min(reconnect_sem.available_permits());
+
+    if attempts == 0 {
         outage_next_attempt.insert(key, now + Duration::from_millis(min_backoff_ms.max(250)));
         debug!(
             dc = %key.0,
             family = ?key.1,
             %endpoint,
+            alive,
             required,
+            missing,
             "Single-endpoint outage reconnect deferred by health reconnect budget"
         );
         return;
     }
-    let Ok(_reconnect_permit) = reconnect_sem.clone().try_acquire_owned() else {
-        outage_next_attempt.insert(key, now + Duration::from_millis(min_backoff_ms.max(250)));
-        debug!(
-            dc = %key.0,
-            family = ?key.1,
-            %endpoint,
-            required,
-            "Single-endpoint outage reconnect deferred by semaphore saturation"
-        );
-        return;
-    };
-    pool.stats.increment_me_reconnect_attempt();
-    pool.stats
-        .increment_me_single_endpoint_outage_reconnect_attempt_total();
 
-    let bypass_quarantine = pool.single_endpoint_outage_disable_quarantine();
-    let attempt_ok = if bypass_quarantine {
+    let mut successes = 0usize;
+    let mut attempted = 0usize;
+    for _ in 0..attempts {
+        let Ok(_reconnect_permit) = reconnect_sem.clone().try_acquire_owned() else {
+            break;
+        };
+        attempted += 1;
+        pool.stats.increment_me_reconnect_attempt();
         pool.stats
-            .increment_me_single_endpoint_quarantine_bypass_total();
-        match tokio::time::timeout(
-            pool.reconnect_runtime.me_one_timeout,
-            pool.connect_one_for_dc(endpoint, key.0, rng.as_ref()),
-        )
-        .await
-        {
-            Ok(Ok(())) => true,
-            Ok(Err(e)) => {
-                debug!(
-                    dc = %key.0,
-                    family = ?key.1,
-                    %endpoint,
-                    error = %e,
-                    "Single-endpoint outage reconnect failed (quarantine bypass path)"
-                );
-                false
-            }
-            Err(_) => {
-                debug!(
-                    dc = %key.0,
-                    family = ?key.1,
-                    %endpoint,
-                    "Single-endpoint outage reconnect timed out (quarantine bypass path)"
-                );
-                false
-            }
-        }
-    } else {
-        let one_endpoint = [endpoint];
-        match tokio::time::timeout(
-            pool.reconnect_runtime.me_one_timeout,
-            pool.connect_endpoints_round_robin(key.0, &one_endpoint, rng.as_ref()),
-        )
-        .await
-        {
-            Ok(ok) => ok,
-            Err(_) => {
-                debug!(
-                    dc = %key.0,
-                    family = ?key.1,
-                    %endpoint,
-                    "Single-endpoint outage reconnect timed out"
-                );
-                false
-            }
-        }
-    };
+            .increment_me_single_endpoint_outage_reconnect_attempt_total();
 
-    if attempt_ok {
+        let bypass_quarantine = pool.single_endpoint_outage_disable_quarantine();
+        let attempt_ok = if bypass_quarantine {
+            pool.stats
+                .increment_me_single_endpoint_quarantine_bypass_total();
+            match tokio::time::timeout(
+                pool.reconnect_runtime.me_one_timeout,
+                pool.connect_one_for_dc(endpoint, key.0, rng.as_ref()),
+            )
+            .await
+            {
+                Ok(Ok(())) => true,
+                Ok(Err(e)) => {
+                    debug!(
+                        dc = %key.0,
+                        family = ?key.1,
+                        %endpoint,
+                        error = %e,
+                        "Single-endpoint outage reconnect failed (quarantine bypass path)"
+                    );
+                    false
+                }
+                Err(_) => {
+                    debug!(
+                        dc = %key.0,
+                        family = ?key.1,
+                        %endpoint,
+                        "Single-endpoint outage reconnect timed out (quarantine bypass path)"
+                    );
+                    false
+                }
+            }
+        } else {
+            let one_endpoint = [endpoint];
+            match tokio::time::timeout(
+                pool.reconnect_runtime.me_one_timeout,
+                pool.connect_endpoints_round_robin(key.0, &one_endpoint, rng.as_ref()),
+            )
+            .await
+            {
+                Ok(ok) => ok,
+                Err(_) => {
+                    debug!(
+                        dc = %key.0,
+                        family = ?key.1,
+                        %endpoint,
+                        "Single-endpoint outage reconnect timed out"
+                    );
+                    false
+                }
+            }
+        };
+
+        if !attempt_ok {
+            break;
+        }
+
+        successes += 1;
         pool.stats
             .increment_me_single_endpoint_outage_reconnect_success_total();
         pool.stats.increment_me_reconnect_success();
+    }
+
+    if successes > 0 {
         outage_backoff.insert(key, min_backoff_ms);
         let jitter = min_backoff_ms / JITTER_FRAC_NUM;
         let wait = Duration::from_millis(min_backoff_ms)
@@ -1507,7 +1632,12 @@ async fn recover_single_endpoint_outage(
             dc = %key.0,
             family = ?key.1,
             %endpoint,
+            alive,
             required,
+            missing,
+            attempted,
+            successes,
+            alive_after = alive.saturating_add(successes),
             backoff_ms = min_backoff_ms,
             "Single-endpoint outage reconnect succeeded"
         );
@@ -1548,6 +1678,20 @@ async fn maybe_rotate_single_endpoint_shadow(
         return;
     }
 
+    let endpoint = endpoints[0];
+    let bound_clients = live_writer_ids_by_addr
+        .get(&(dc, endpoint))
+        .map(|writer_ids| {
+            writer_ids
+                .iter()
+                .map(|writer_id| bound_clients_by_writer.get(writer_id).copied().unwrap_or(0))
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    if bound_clients > 0 {
+        return;
+    }
+
     let Some(interval) = pool.single_endpoint_shadow_rotate_interval() else {
         return;
     };
@@ -1559,7 +1703,6 @@ async fn maybe_rotate_single_endpoint_shadow(
         return;
     }
 
-    let endpoint = endpoints[0];
     if pool.is_endpoint_quarantined(endpoint).await {
         pool.stats
             .increment_me_single_endpoint_shadow_rotate_skipped_quarantine_total();
@@ -1744,14 +1887,25 @@ pub async fn me_zombie_writer_watchdog(pool: Arc<MePool>) {
         for (writer_id, had_clients) in &zombie_ids_with_meta {
             let result = tokio::time::timeout(
                 Duration::from_secs(REMOVE_TIMEOUT_SECS),
-                pool.remove_writer_and_close_clients(*writer_id),
+                pool.remove_writer_and_close_clients_with_reason(
+                    *writer_id,
+                    "zombie_watchdog_force_close",
+                ),
             )
             .await;
             match result {
-                Ok(()) => {
+                Ok(removed) => {
                     removal_timeout_streak.remove(writer_id);
-                    pool.stats.increment_pool_force_close_total();
-                    info!(writer_id, had_clients, "Zombie writer removed by watchdog");
+                    if removed {
+                        pool.stats.increment_pool_force_close_total();
+                        info!(writer_id, had_clients, "Zombie writer removed by watchdog");
+                    } else {
+                        debug!(
+                            writer_id,
+                            had_clients,
+                            "Zombie writer was already removed before watchdog cleanup"
+                        );
+                    }
                 }
                 Err(_) => {
                     let streak = removal_timeout_streak
@@ -2005,10 +2159,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_writer_pre_refresh_is_disabled_when_keepalive_is_enabled() {
+    async fn idle_writer_pre_refresh_runs_with_keepalive_enabled() {
         let pool = make_pool(0).await;
 
-        assert!(!idle_writer_pre_refresh_enabled(&pool));
+        assert!(idle_writer_pre_refresh_enabled(&pool));
     }
 
     #[tokio::test]
@@ -2022,6 +2176,7 @@ mod tests {
         let live_addr_counts = HashMap::new();
         let live_writer_ids_by_addr = HashMap::new();
         let bound_clients_by_writer = HashMap::new();
+        let mut adaptive_floor_target_hold = HashMap::new();
 
         let plan = build_family_floor_plan(
             &pool,
@@ -2030,6 +2185,7 @@ mod tests {
             &live_addr_counts,
             &live_writer_ids_by_addr,
             &bound_clients_by_writer,
+            &mut adaptive_floor_target_hold,
         )
         .await;
 
@@ -2052,6 +2208,7 @@ mod tests {
         let live_addr_counts = HashMap::new();
         let live_writer_ids_by_addr = HashMap::new();
         let bound_clients_by_writer = HashMap::new();
+        let mut adaptive_floor_target_hold = HashMap::new();
 
         let plan = build_family_floor_plan(
             &pool,
@@ -2060,6 +2217,7 @@ mod tests {
             &live_addr_counts,
             &live_writer_ids_by_addr,
             &bound_clients_by_writer,
+            &mut adaptive_floor_target_hold,
         )
         .await;
 
@@ -2084,6 +2242,7 @@ mod tests {
         let live_addr_counts = HashMap::from([((2, endpoint), 1usize)]);
         let live_writer_ids_by_addr = HashMap::from([((2, endpoint), vec![42u64])]);
         let bound_clients_by_writer = HashMap::from([(42u64, 1usize)]);
+        let mut adaptive_floor_target_hold = HashMap::new();
 
         let plan = build_family_floor_plan(
             &pool,
@@ -2092,6 +2251,7 @@ mod tests {
             &live_addr_counts,
             &live_writer_ids_by_addr,
             &bound_clients_by_writer,
+            &mut adaptive_floor_target_hold,
         )
         .await;
 
@@ -2099,6 +2259,52 @@ mod tests {
         assert_eq!(entry.min_required, 1);
         assert_eq!(entry.target_required, 4);
         assert_eq!(plan.target_writers_total, 4);
+    }
+
+    #[tokio::test]
+    async fn adaptive_floor_holds_recent_high_target_during_recovery_grace() {
+        let pool = make_pool(0).await;
+        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), 443);
+        let endpoints = vec![
+            endpoint,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)), 443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 3)), 443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 4)), 443),
+        ];
+        let dc_endpoints = HashMap::from([(2, endpoints)]);
+        let live_addr_counts = HashMap::from([((2, endpoint), 1usize)]);
+        let live_writer_ids_by_addr = HashMap::from([((2, endpoint), vec![42u64])]);
+        let mut adaptive_floor_target_hold = HashMap::new();
+
+        let busy_plan = build_family_floor_plan(
+            &pool,
+            IpFamily::V4,
+            &dc_endpoints,
+            &live_addr_counts,
+            &live_writer_ids_by_addr,
+            &HashMap::from([(42u64, 640usize)]),
+            &mut adaptive_floor_target_hold,
+        )
+        .await;
+        let busy_target = busy_plan.by_dc.get(&2).unwrap().target_required;
+        assert!(busy_target > 4);
+
+        let idle_plan = build_family_floor_plan(
+            &pool,
+            IpFamily::V4,
+            &dc_endpoints,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut adaptive_floor_target_hold,
+        )
+        .await;
+
+        assert_eq!(
+            idle_plan.by_dc.get(&2).unwrap().target_required,
+            busy_target
+        );
+        assert_eq!(idle_plan.target_writers_total, busy_target);
     }
 
     #[tokio::test]

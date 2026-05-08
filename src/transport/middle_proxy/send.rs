@@ -19,7 +19,7 @@ use crate::protocol::constants::{RPC_CLOSE_CONN_U32, RPC_CLOSE_EXT_U32};
 use super::MePool;
 use super::codec::WriterCommand;
 use super::pool::WriterContour;
-use super::registry::ConnMeta;
+use super::registry::{BindWriterResult, ConnMeta};
 use super::wire::build_proxy_req_payload;
 use rand::seq::SliceRandom;
 
@@ -111,15 +111,37 @@ impl MePool {
                             self.note_hybrid_route_success();
                             return Ok(());
                         }
-                        warn!(writer_id = current.writer_id, "ME writer channel closed");
-                        self.remove_writer_and_close_clients(current.writer_id)
-                            .await;
+                        if self
+                            .remove_writer_and_close_clients_with_reason(
+                                current.writer_id,
+                                "bound_writer_send_closed_after_full",
+                            )
+                            .await
+                        {
+                            warn!(writer_id = current.writer_id, "ME writer channel closed");
+                        } else {
+                            debug!(
+                                writer_id = current.writer_id,
+                                "ME writer channel already removed"
+                            );
+                        }
                         continue;
                     }
                     Err(TrySendError::Closed(_)) => {
-                        warn!(writer_id = current.writer_id, "ME writer channel closed");
-                        self.remove_writer_and_close_clients(current.writer_id)
-                            .await;
+                        if self
+                            .remove_writer_and_close_clients_with_reason(
+                                current.writer_id,
+                                "bound_writer_try_send_closed",
+                            )
+                            .await
+                        {
+                            warn!(writer_id = current.writer_id, "ME writer channel closed");
+                        } else {
+                            debug!(
+                                writer_id = current.writer_id,
+                                "ME writer channel already removed"
+                            );
+                        }
                         continue;
                     }
                 }
@@ -442,15 +464,32 @@ impl MePool {
                 let (payload, meta) = build_routed_payload(effective_our_addr);
                 match w.tx.clone().try_reserve_owned() {
                     Ok(permit) => {
-                        if !self.registry.bind_writer(conn_id, w.id, meta).await {
-                            debug!(
-                                conn_id,
-                                writer_id = w.id,
-                                "ME writer disappeared before bind commit, pruning stale writer"
-                            );
-                            drop(permit);
-                            self.remove_writer_and_close_clients(w.id).await;
-                            continue;
+                        match self.registry.bind_writer_checked(conn_id, w.id, meta).await {
+                            BindWriterResult::Bound => {}
+                            BindWriterResult::ConnMissing => {
+                                debug!(
+                                    conn_id,
+                                    writer_id = w.id,
+                                    "ME bind skipped because client connection disappeared before commit"
+                                );
+                                self.stats
+                                    .increment_me_bind_commit_miss_total("conn_missing");
+                                drop(permit);
+                                return Err(ProxyError::Proxy(
+                                    "Client connection closed before ME bind".into(),
+                                ));
+                            }
+                            BindWriterResult::WriterMissing => {
+                                debug!(
+                                    conn_id,
+                                    writer_id = w.id,
+                                    "ME bind skipped because writer disappeared before commit"
+                                );
+                                self.stats
+                                    .increment_me_bind_commit_miss_total("writer_missing");
+                                drop(permit);
+                                continue;
+                            }
                         }
                         permit.send(WriterCommand::Data(payload.clone()));
                         self.stats
@@ -475,8 +514,17 @@ impl MePool {
                     }
                     Err(TrySendError::Closed(_)) => {
                         self.stats.increment_me_writer_pick_closed_total(pick_mode);
-                        warn!(writer_id = w.id, "ME writer channel closed");
-                        self.remove_writer_and_close_clients(w.id).await;
+                        if self
+                            .remove_writer_and_close_clients_with_reason(
+                                w.id,
+                                "candidate_try_reserve_closed",
+                            )
+                            .await
+                        {
+                            warn!(writer_id = w.id, "ME writer channel closed");
+                        } else {
+                            debug!(writer_id = w.id, "ME writer channel already removed");
+                        }
                         continue;
                     }
                 }
@@ -510,15 +558,32 @@ impl MePool {
                 };
             match reserve_result {
                 Ok(permit) => {
-                    if !self.registry.bind_writer(conn_id, w.id, meta).await {
-                        debug!(
-                            conn_id,
-                            writer_id = w.id,
-                            "ME writer disappeared before fallback bind commit, pruning stale writer"
-                        );
-                        drop(permit);
-                        self.remove_writer_and_close_clients(w.id).await;
-                        continue;
+                    match self.registry.bind_writer_checked(conn_id, w.id, meta).await {
+                        BindWriterResult::Bound => {}
+                        BindWriterResult::ConnMissing => {
+                            debug!(
+                                conn_id,
+                                writer_id = w.id,
+                                "ME fallback bind skipped because client connection disappeared before commit"
+                            );
+                            self.stats
+                                .increment_me_bind_commit_miss_total("fallback_conn_missing");
+                            drop(permit);
+                            return Err(ProxyError::Proxy(
+                                "Client connection closed before ME fallback bind".into(),
+                            ));
+                        }
+                        BindWriterResult::WriterMissing => {
+                            debug!(
+                                conn_id,
+                                writer_id = w.id,
+                                "ME fallback bind skipped because writer disappeared before commit"
+                            );
+                            self.stats
+                                .increment_me_bind_commit_miss_total("fallback_writer_missing");
+                            drop(permit);
+                            continue;
+                        }
                     }
                     permit.send(WriterCommand::Data(payload.clone()));
                     self.stats
@@ -531,8 +596,17 @@ impl MePool {
                 }
                 Err(_) => {
                     self.stats.increment_me_writer_pick_closed_total(pick_mode);
-                    warn!(writer_id = w.id, "ME writer channel closed (blocking)");
-                    self.remove_writer_and_close_clients(w.id).await;
+                    if self
+                        .remove_writer_and_close_clients_with_reason(
+                            w.id,
+                            "fallback_reserve_closed",
+                        )
+                        .await
+                    {
+                        warn!(writer_id = w.id, "ME writer channel closed (blocking)");
+                    } else {
+                        debug!(writer_id = w.id, "ME writer channel already removed");
+                    }
                 }
             }
         }
@@ -744,7 +818,8 @@ impl MePool {
                 .is_err()
             {
                 debug!("ME close write failed");
-                self.remove_writer_and_close_clients(w.writer_id).await;
+                self.remove_writer_and_close_clients_with_reason(w.writer_id, "send_close_failed")
+                    .await;
             }
         } else {
             debug!(conn_id, "ME close skipped (writer missing)");

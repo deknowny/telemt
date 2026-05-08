@@ -622,7 +622,8 @@ impl MePool {
                 .await;
             if can_drop_with_replacement {
                 self.stats.increment_pool_force_close_total();
-                self.remove_writer_and_close_clients(writer_id).await;
+                self.remove_writer_and_close_clients_with_reason(writer_id, "reinit_fast_rebind")
+                    .await;
             }
         }
         if hardswap {

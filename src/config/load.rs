@@ -646,6 +646,18 @@ impl ProxyConfig {
             ));
         }
 
+        if !(1..=65_536).contains(&config.censorship.mask_tcp_global_concurrency) {
+            return Err(ProxyError::Config(
+                "censorship.mask_tcp_global_concurrency must be within [1, 65536]".to_string(),
+            ));
+        }
+
+        if !(1..=4096).contains(&config.censorship.mask_tcp_per_peer_concurrency) {
+            return Err(ProxyError::Config(
+                "censorship.mask_tcp_per_peer_concurrency must be within [1, 4096]".to_string(),
+            ));
+        }
+
         if !(5..=50).contains(&config.censorship.mask_classifier_prefetch_timeout_ms) {
             return Err(ProxyError::Config(
                 "censorship.mask_classifier_prefetch_timeout_ms must be within [5, 50]".to_string(),

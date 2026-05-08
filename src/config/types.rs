@@ -1792,6 +1792,16 @@ pub struct AntiCensorshipConfig {
     #[serde(default = "default_mask_relay_idle_timeout_ms")]
     pub mask_relay_idle_timeout_ms: u64,
 
+    /// Maximum concurrent TCP masking sessions across all peers.
+    /// This protects the service accept loop and file descriptors from TLS probe floods.
+    #[serde(default = "default_mask_tcp_global_concurrency")]
+    pub mask_tcp_global_concurrency: usize,
+
+    /// Maximum concurrent TCP masking sessions per source IP.
+    /// Correct MTProxy clients do not use this path; it only throttles unauthenticated masking.
+    #[serde(default = "default_mask_tcp_per_peer_concurrency")]
+    pub mask_tcp_per_peer_concurrency: usize,
+
     /// Prefetch timeout (ms) for extending fragmented masking classifier window.
     #[serde(default = "default_mask_classifier_prefetch_timeout_ms")]
     pub mask_classifier_prefetch_timeout_ms: u64,
@@ -1840,6 +1850,8 @@ impl Default for AntiCensorshipConfig {
             mask_relay_max_bytes: default_mask_relay_max_bytes(),
             mask_relay_timeout_ms: default_mask_relay_timeout_ms(),
             mask_relay_idle_timeout_ms: default_mask_relay_idle_timeout_ms(),
+            mask_tcp_global_concurrency: default_mask_tcp_global_concurrency(),
+            mask_tcp_per_peer_concurrency: default_mask_tcp_per_peer_concurrency(),
             mask_classifier_prefetch_timeout_ms: default_mask_classifier_prefetch_timeout_ms(),
             mask_timing_normalization_enabled: default_mask_timing_normalization_enabled(),
             mask_timing_normalization_floor_ms: default_mask_timing_normalization_floor_ms(),

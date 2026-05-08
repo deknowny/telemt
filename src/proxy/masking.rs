@@ -8,12 +8,11 @@ use crate::transport::proxy_protocol::{ProxyProtocolV1Builder, ProxyProtocolV2Bu
 use nix::ifaddrs::getifaddrs;
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::str;
-#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(unix)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant as StdInstant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -22,7 +21,7 @@ use tokio::net::UnixStream;
 #[cfg(unix)]
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{Instant, timeout};
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[cfg(not(test))]
 const MASK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -40,6 +39,166 @@ const MASK_BUFFER_SIZE: usize = 8192;
 const LOCAL_INTERFACE_CACHE_TTL: Duration = Duration::from_secs(300);
 #[cfg(all(unix, test))]
 const LOCAL_INTERFACE_CACHE_TTL: Duration = Duration::from_secs(1);
+
+static MASK_EVENT_COUNTS: OnceLock<Mutex<BTreeMap<&'static str, u64>>> = OnceLock::new();
+static MASK_TCP_ACTIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+static MASK_TCP_ACTIVE_CONNECTS: AtomicUsize = AtomicUsize::new(0);
+static MASK_TCP_ACTIVE_RELAYS: AtomicUsize = AtomicUsize::new(0);
+static MASK_TCP_PEER_ACTIVE: OnceLock<Mutex<HashMap<IpAddr, Arc<AtomicUsize>>>> = OnceLock::new();
+
+fn mask_event_counts_store() -> &'static Mutex<BTreeMap<&'static str, u64>> {
+    MASK_EVENT_COUNTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn record_mask_event(event: &'static str) {
+    let Ok(mut guard) = mask_event_counts_store().lock() else {
+        return;
+    };
+
+    let counter = guard.entry(event).or_insert(0);
+    *counter = counter.saturating_add(1);
+}
+
+pub(crate) fn mask_event_counts_for_metrics() -> Vec<(&'static str, u64)> {
+    mask_event_counts_store()
+        .lock()
+        .map(|guard| {
+            guard
+                .iter()
+                .map(|(event, count)| (*event, *count))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn mask_active_counts_for_metrics() -> Vec<(&'static str, usize)> {
+    let peer_slots = MASK_TCP_PEER_ACTIVE
+        .get()
+        .and_then(|store| store.lock().ok().map(|guard| guard.len()))
+        .unwrap_or(0);
+
+    vec![
+        (
+            "tcp_session",
+            MASK_TCP_ACTIVE_SESSIONS.load(Ordering::Relaxed),
+        ),
+        (
+            "tcp_connect",
+            MASK_TCP_ACTIVE_CONNECTS.load(Ordering::Relaxed),
+        ),
+        ("tcp_relay", MASK_TCP_ACTIVE_RELAYS.load(Ordering::Relaxed)),
+        ("tcp_peer_slot", peer_slots),
+    ]
+}
+
+fn try_increment_limited(counter: &AtomicUsize, limit: usize) -> bool {
+    let limit = limit.max(1);
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current >= limit {
+            return false;
+        }
+
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(next) => current = next,
+        }
+    }
+}
+
+struct ActiveCounterGuard(&'static AtomicUsize);
+
+impl ActiveCounterGuard {
+    fn new(counter: &'static AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+
+impl Drop for ActiveCounterGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct MaskTcpSessionGuard {
+    peer_ip: IpAddr,
+    peer_counter: Arc<AtomicUsize>,
+}
+
+impl Drop for MaskTcpSessionGuard {
+    fn drop(&mut self) {
+        MASK_TCP_ACTIVE_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.peer_counter.fetch_sub(1, Ordering::AcqRel);
+        if previous != 1 {
+            return;
+        }
+
+        let Some(store) = MASK_TCP_PEER_ACTIVE.get() else {
+            return;
+        };
+        let Ok(mut guard) = store.lock() else {
+            return;
+        };
+        let removable = guard
+            .get(&self.peer_ip)
+            .map(|counter| {
+                Arc::ptr_eq(counter, &self.peer_counter) && counter.load(Ordering::Acquire) == 0
+            })
+            .unwrap_or(false);
+        if removable {
+            guard.remove(&self.peer_ip);
+        }
+    }
+}
+
+fn try_acquire_mask_tcp_session(
+    peer_ip: IpAddr,
+    config: &ProxyConfig,
+) -> Option<MaskTcpSessionGuard> {
+    if !try_increment_limited(
+        &MASK_TCP_ACTIVE_SESSIONS,
+        config.censorship.mask_tcp_global_concurrency,
+    ) {
+        record_mask_event("tcp_limited_global");
+        return None;
+    }
+
+    let peer_counter = {
+        let store = MASK_TCP_PEER_ACTIVE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = match store.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                MASK_TCP_ACTIVE_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+                record_mask_event("tcp_limiter_poisoned");
+                return None;
+            }
+        };
+        guard
+            .entry(peer_ip)
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .clone()
+    };
+
+    if !try_increment_limited(
+        peer_counter.as_ref(),
+        config.censorship.mask_tcp_per_peer_concurrency,
+    ) {
+        MASK_TCP_ACTIVE_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+        record_mask_event("tcp_limited_peer");
+        return None;
+    }
+
+    Some(MaskTcpSessionGuard {
+        peer_ip,
+        peer_counter,
+    })
+}
 
 struct CopyOutcome {
     total: usize,
@@ -634,6 +793,7 @@ pub async fn handle_bad_client<R, W>(
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    record_mask_event("start");
     let client_type = detect_client_type(initial_data);
     if config.general.beobachten {
         let ttl = masking_beobachten_ttl(config);
@@ -644,6 +804,7 @@ pub async fn handle_bad_client<R, W>(
     let idle_timeout = Duration::from_millis(config.censorship.mask_relay_idle_timeout_ms);
 
     if !config.censorship.mask {
+        record_mask_event("disabled");
         // Masking disabled, just consume data
         consume_client_data_with_timeout_and_cap(
             reader,
@@ -670,6 +831,7 @@ pub async fn handle_bad_client<R, W>(
         let connect_result = timeout(MASK_TIMEOUT, UnixStream::connect(sock_path)).await;
         match connect_result {
             Ok(Ok(stream)) => {
+                record_mask_event("unix_connect_success");
                 let (mask_read, mut mask_write) = stream.into_split();
                 let proxy_header = build_mask_proxy_header(
                     config.censorship.mask_proxy_protocol,
@@ -679,10 +841,18 @@ pub async fn handle_bad_client<R, W>(
                 if let Some(header) = proxy_header
                     && !write_proxy_header_with_timeout(&mut mask_write, &header).await
                 {
+                    record_mask_event("proxy_header_write_failed");
+                    warn!(
+                        peer = %peer,
+                        client_type = client_type,
+                        sock = %sock_path,
+                        elapsed_ms = outcome_started.elapsed().as_millis(),
+                        "Mask unix proxy header write failed"
+                    );
                     wait_mask_outcome_budget(outcome_started, config).await;
                     return;
                 }
-                if timeout(
+                match timeout(
                     relay_timeout,
                     relay_to_mask(
                         reader,
@@ -701,15 +871,45 @@ pub async fn handle_bad_client<R, W>(
                     ),
                 )
                 .await
-                .is_err()
                 {
-                    debug!("Mask relay timed out (unix socket)");
+                    Err(_) => {
+                        record_mask_event("relay_timeout");
+                        warn!(
+                            peer = %peer,
+                            client_type = client_type,
+                            sock = %sock_path,
+                            relay_timeout_ms = relay_timeout.as_millis(),
+                            elapsed_ms = outcome_started.elapsed().as_millis(),
+                            "Mask relay timed out (unix socket)"
+                        );
+                    }
+                    Ok(false) => {
+                        record_mask_event("relay_io_error");
+                        warn!(
+                            peer = %peer,
+                            client_type = client_type,
+                            sock = %sock_path,
+                            elapsed_ms = outcome_started.elapsed().as_millis(),
+                            "Mask relay ended before initial data reached unix mask backend"
+                        );
+                    }
+                    Ok(true) => {
+                        record_mask_event("relay_completed");
+                    }
                 }
                 wait_mask_outcome_budget(outcome_started, config).await;
             }
             Ok(Err(e)) => {
+                record_mask_event("unix_connect_failed");
                 wait_mask_connect_budget_if_needed(connect_started, config).await;
-                debug!(error = %e, "Failed to connect to mask unix socket");
+                warn!(
+                    peer = %peer,
+                    client_type = client_type,
+                    sock = %sock_path,
+                    error = %e,
+                    elapsed_ms = outcome_started.elapsed().as_millis(),
+                    "Failed to connect to mask unix socket"
+                );
                 consume_client_data_with_timeout_and_cap(
                     reader,
                     config.censorship.mask_relay_max_bytes,
@@ -720,7 +920,15 @@ pub async fn handle_bad_client<R, W>(
                 wait_mask_outcome_budget(outcome_started, config).await;
             }
             Err(_) => {
-                debug!("Timeout connecting to mask unix socket");
+                record_mask_event("unix_connect_timeout");
+                warn!(
+                    peer = %peer,
+                    client_type = client_type,
+                    sock = %sock_path,
+                    timeout_ms = MASK_TIMEOUT.as_millis(),
+                    elapsed_ms = outcome_started.elapsed().as_millis(),
+                    "Timeout connecting to mask unix socket"
+                );
                 consume_client_data_with_timeout_and_cap(
                     reader,
                     config.censorship.mask_relay_max_bytes,
@@ -748,6 +956,7 @@ pub async fn handle_bad_client<R, W>(
     if is_mask_target_local_listener_async(mask_host, mask_port, local_addr, resolved_mask_addr)
         .await
     {
+        record_mask_event("self_target");
         let outcome_started = Instant::now();
         debug!(
             client_type = client_type,
@@ -781,10 +990,37 @@ pub async fn handle_bad_client<R, W>(
     let mask_addr = resolved_mask_addr
         .map(|addr| addr.to_string())
         .unwrap_or_else(|| format!("{}:{}", mask_host, mask_port));
+    let Some(_tcp_session_guard) = try_acquire_mask_tcp_session(peer.ip(), config) else {
+        record_mask_event("tcp_limited");
+        debug!(
+            peer = %peer,
+            client_type = client_type,
+            host = %mask_host,
+            port = mask_port,
+            addr = %mask_addr,
+            active_sessions = MASK_TCP_ACTIVE_SESSIONS.load(Ordering::Relaxed),
+            global_limit = config.censorship.mask_tcp_global_concurrency,
+            per_peer_limit = config.censorship.mask_tcp_per_peer_concurrency,
+            "Mask TCP concurrency limit reached; draining client without opening mask backend"
+        );
+        consume_client_data_with_timeout_and_cap(
+            reader,
+            config.censorship.mask_relay_max_bytes,
+            relay_timeout,
+            idle_timeout,
+        )
+        .await;
+        wait_mask_outcome_budget(outcome_started, config).await;
+        return;
+    };
     let connect_started = Instant::now();
-    let connect_result = timeout(MASK_TIMEOUT, TcpStream::connect(&mask_addr)).await;
+    let connect_result = {
+        let _active_connect = ActiveCounterGuard::new(&MASK_TCP_ACTIVE_CONNECTS);
+        timeout(MASK_TIMEOUT, TcpStream::connect(&mask_addr)).await
+    };
     match connect_result {
         Ok(Ok(stream)) => {
+            record_mask_event("tcp_connect_success");
             let proxy_header =
                 build_mask_proxy_header(config.censorship.mask_proxy_protocol, peer, local_addr);
 
@@ -792,10 +1028,21 @@ pub async fn handle_bad_client<R, W>(
             if let Some(header) = proxy_header
                 && !write_proxy_header_with_timeout(&mut mask_write, &header).await
             {
+                record_mask_event("proxy_header_write_failed");
+                warn!(
+                    peer = %peer,
+                    client_type = client_type,
+                    host = %mask_host,
+                    port = mask_port,
+                    addr = %mask_addr,
+                    elapsed_ms = outcome_started.elapsed().as_millis(),
+                    "Mask TCP proxy header write failed"
+                );
                 wait_mask_outcome_budget(outcome_started, config).await;
                 return;
             }
-            if timeout(
+            let _active_relay = ActiveCounterGuard::new(&MASK_TCP_ACTIVE_RELAYS);
+            match timeout(
                 relay_timeout,
                 relay_to_mask(
                     reader,
@@ -814,15 +1061,51 @@ pub async fn handle_bad_client<R, W>(
                 ),
             )
             .await
-            .is_err()
             {
-                debug!("Mask relay timed out");
+                Err(_) => {
+                    record_mask_event("relay_timeout");
+                    warn!(
+                        peer = %peer,
+                        client_type = client_type,
+                        host = %mask_host,
+                        port = mask_port,
+                        addr = %mask_addr,
+                        relay_timeout_ms = relay_timeout.as_millis(),
+                        elapsed_ms = outcome_started.elapsed().as_millis(),
+                        "Mask relay timed out"
+                    );
+                }
+                Ok(false) => {
+                    record_mask_event("relay_io_error");
+                    warn!(
+                        peer = %peer,
+                        client_type = client_type,
+                        host = %mask_host,
+                        port = mask_port,
+                        addr = %mask_addr,
+                        elapsed_ms = outcome_started.elapsed().as_millis(),
+                        "Mask relay ended before initial data reached mask backend"
+                    );
+                }
+                Ok(true) => {
+                    record_mask_event("relay_completed");
+                }
             }
             wait_mask_outcome_budget(outcome_started, config).await;
         }
         Ok(Err(e)) => {
+            record_mask_event("tcp_connect_failed");
             wait_mask_connect_budget_if_needed(connect_started, config).await;
-            debug!(error = %e, "Failed to connect to mask host");
+            warn!(
+                peer = %peer,
+                client_type = client_type,
+                host = %mask_host,
+                port = mask_port,
+                addr = %mask_addr,
+                error = %e,
+                elapsed_ms = outcome_started.elapsed().as_millis(),
+                "Failed to connect to mask host"
+            );
             consume_client_data_with_timeout_and_cap(
                 reader,
                 config.censorship.mask_relay_max_bytes,
@@ -833,7 +1116,17 @@ pub async fn handle_bad_client<R, W>(
             wait_mask_outcome_budget(outcome_started, config).await;
         }
         Err(_) => {
-            debug!("Timeout connecting to mask host");
+            record_mask_event("tcp_connect_timeout");
+            warn!(
+                peer = %peer,
+                client_type = client_type,
+                host = %mask_host,
+                port = mask_port,
+                addr = %mask_addr,
+                timeout_ms = MASK_TIMEOUT.as_millis(),
+                elapsed_ms = outcome_started.elapsed().as_millis(),
+                "Timeout connecting to mask host"
+            );
             consume_client_data_with_timeout_and_cap(
                 reader,
                 config.censorship.mask_relay_max_bytes,
@@ -861,7 +1154,8 @@ async fn relay_to_mask<R, W, MR, MW>(
     shape_hardening_aggressive_mode: bool,
     mask_relay_max_bytes: usize,
     idle_timeout: Duration,
-) where
+) -> bool
+where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
     MR: AsyncRead + Unpin + Send + 'static,
@@ -869,10 +1163,10 @@ async fn relay_to_mask<R, W, MR, MW>(
 {
     // Send initial data to mask host
     if mask_write.write_all(initial_data).await.is_err() {
-        return;
+        return false;
     }
     if mask_write.flush().await.is_err() {
-        return;
+        return false;
     }
 
     let (upstream_copy, downstream_copy) = tokio::join!(
@@ -919,6 +1213,7 @@ async fn relay_to_mask<R, W, MR, MW>(
 
     let _ = mask_write.shutdown().await;
     let _ = writer.shutdown().await;
+    true
 }
 
 /// Just consume all data from client without responding.

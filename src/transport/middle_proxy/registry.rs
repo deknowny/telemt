@@ -49,6 +49,13 @@ pub struct ConnWriter {
     pub tx: mpsc::Sender<WriterCommand>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindWriterResult {
+    Bound,
+    ConnMissing,
+    WriterMissing,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct WriterActivitySnapshot {
     pub bound_clients_by_writer: HashMap<u64, usize>,
@@ -446,17 +453,22 @@ impl ConnRegistry {
         }
     }
 
-    pub async fn bind_writer(&self, conn_id: u64, writer_id: u64, meta: ConnMeta) -> bool {
+    pub async fn bind_writer_checked(
+        &self,
+        conn_id: u64,
+        writer_id: u64,
+        meta: ConnMeta,
+    ) -> BindWriterResult {
         {
             let mut binding = self.binding.inner.lock().await;
             // ROUTING IS THE SOURCE OF TRUTH:
             // never keep/attach writer binding for a connection that is already
             // absent from the routing table.
             if !self.routing.map.contains_key(&conn_id) {
-                return false;
+                return BindWriterResult::ConnMissing;
             }
             if !binding.writers.contains_key(&writer_id) {
-                return false;
+                return BindWriterResult::WriterMissing;
             }
 
             let previous_writer_id = binding.writer_for_conn.insert(conn_id, writer_id);
@@ -489,7 +501,15 @@ impl ConnRegistry {
         self.hot_binding
             .map
             .insert(conn_id, HotConnBinding { writer_id, meta });
-        true
+        BindWriterResult::Bound
+    }
+
+    #[allow(dead_code)]
+    pub async fn bind_writer(&self, conn_id: u64, writer_id: u64, meta: ConnMeta) -> bool {
+        matches!(
+            self.bind_writer_checked(conn_id, writer_id, meta).await,
+            BindWriterResult::Bound
+        )
     }
 
     pub async fn mark_writer_idle(&self, writer_id: u64) {
@@ -671,7 +691,7 @@ mod tests {
 
     use bytes::Bytes;
 
-    use super::{ConnMeta, ConnRegistry, RouteResult};
+    use super::{BindWriterResult, ConnMeta, ConnRegistry, RouteResult};
     use crate::transport::middle_proxy::MeResponse;
 
     #[tokio::test]
@@ -923,6 +943,33 @@ mod tests {
                 .await
         );
         assert!(registry.get_writer(conn_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn bind_writer_checked_distinguishes_missing_conn_and_writer() {
+        let registry = ConnRegistry::new();
+        let (conn_id, _rx) = registry.register().await;
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+        let meta = ConnMeta {
+            target_dc: 2,
+            client_addr: addr,
+            our_addr: addr,
+            proto_flags: 0,
+        };
+
+        assert_eq!(
+            registry
+                .bind_writer_checked(conn_id, 10, meta.clone())
+                .await,
+            BindWriterResult::WriterMissing
+        );
+
+        registry.unregister(conn_id).await;
+
+        assert_eq!(
+            registry.bind_writer_checked(conn_id, 10, meta).await,
+            BindWriterResult::ConnMissing
+        );
     }
 
     #[tokio::test]
