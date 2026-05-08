@@ -3170,9 +3170,19 @@ async fn render_metrics(
     let _ = writeln!(out, "# TYPE telemt_user_msgs_from_client counter");
     let _ = writeln!(
         out,
+        "# HELP telemt_user_msgs_from_client_total Per-user messages received"
+    );
+    let _ = writeln!(out, "# TYPE telemt_user_msgs_from_client_total counter");
+    let _ = writeln!(
+        out,
         "# HELP telemt_user_msgs_to_client Per-user messages sent"
     );
     let _ = writeln!(out, "# TYPE telemt_user_msgs_to_client counter");
+    let _ = writeln!(
+        out,
+        "# HELP telemt_user_msgs_to_client_total Per-user messages sent"
+    );
+    let _ = writeln!(out, "# TYPE telemt_user_msgs_to_client_total counter");
     let _ = writeln!(
         out,
         "# HELP telemt_ip_reservation_rollback_total IP reservation rollbacks caused by later limit checks"
@@ -3312,7 +3322,20 @@ async fn render_metrics(
             );
             let _ = writeln!(
                 out,
+                "telemt_user_msgs_from_client_total{{user=\"{}\"}} {}",
+                user,
+                s.msgs_from_client
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            );
+            let _ = writeln!(
+                out,
                 "telemt_user_msgs_to_client{{user=\"{}\"}} {}",
+                user,
+                s.msgs_to_client.load(std::sync::atomic::Ordering::Relaxed)
+            );
+            let _ = writeln!(
+                out,
+                "telemt_user_msgs_to_client_total{{user=\"{}\"}} {}",
                 user,
                 s.msgs_to_client.load(std::sync::atomic::Ordering::Relaxed)
             );

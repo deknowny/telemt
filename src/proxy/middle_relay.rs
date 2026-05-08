@@ -1775,8 +1775,10 @@ where
                                 break;
                             }
                             stats.add_user_octets_from_handle(user_stats, payload.len() as u64);
+                            stats.increment_user_msgs_from_handle(user_stats);
                         } else {
                             stats.add_user_octets_from(&user, payload.len() as u64);
+                            stats.increment_user_msgs_from(&user);
                         }
                         let mut flags = proto_flags;
                         if quickack {
@@ -2504,8 +2506,10 @@ where
             );
             if let Some(user_stats) = quota_user_stats {
                 stats.add_user_octets_to_handle(user_stats, data_len);
+                stats.increment_user_msgs_to_handle(user_stats);
             } else {
                 stats.add_user_octets_to(user, data_len);
+                stats.increment_user_msgs_to(user);
             }
             stats.increment_me_d2c_data_frames_total();
             if data_quickack_suppressed {
