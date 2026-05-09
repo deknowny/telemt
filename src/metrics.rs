@@ -557,7 +557,7 @@ async fn render_metrics(
 
     let _ = writeln!(
         out,
-        "# HELP telemt_accept_permit_timeout_total Accepted connections dropped due to permit wait timeout"
+        "# HELP telemt_accept_permit_timeout_total Accepted connections dropped because no connection permit was available"
     );
     let _ = writeln!(out, "# TYPE telemt_accept_permit_timeout_total counter");
     let _ = writeln!(

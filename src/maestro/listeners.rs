@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{ProxyConfig, RstOnCloseMode};
@@ -45,6 +45,45 @@ fn default_link_port(config: &ProxyConfig) -> u16 {
         .first()
         .and_then(|listener| listener.port)
         .unwrap_or(config.server.port)
+}
+
+enum ConnectionPermitDecision {
+    Acquired(OwnedSemaphorePermit),
+    Drop,
+    Closed,
+}
+
+fn try_acquire_connection_permit(
+    max_connections: &Arc<Semaphore>,
+    stats: &Stats,
+    kind: &'static str,
+    peer: Option<SocketAddr>,
+    configured_timeout_ms: u64,
+) -> ConnectionPermitDecision {
+    match max_connections.clone().try_acquire_owned() {
+        Ok(permit) => ConnectionPermitDecision::Acquired(permit),
+        Err(TryAcquireError::NoPermits) => {
+            stats.increment_accept_permit_timeout_total();
+            if let Some(peer) = peer {
+                debug!(
+                    peer = %peer,
+                    kind,
+                    configured_timeout_ms,
+                    "Dropping accepted connection: connection limit reached"
+                );
+            } else {
+                debug!(
+                    kind,
+                    configured_timeout_ms, "Dropping accepted connection: connection limit reached"
+                );
+            }
+            ConnectionPermitDecision::Drop
+        }
+        Err(TryAcquireError::Closed) => {
+            error!("Connection limiter is closed");
+            ConnectionPermitDecision::Closed
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -255,36 +294,19 @@ pub(crate) async fn bind_listeners(
                         }
                         let accept_permit_timeout_ms =
                             config_rx_unix.borrow().server.accept_permit_timeout_ms;
-                        let permit = if accept_permit_timeout_ms == 0 {
-                            match max_connections_unix.clone().acquire_owned().await {
-                                Ok(permit) => permit,
-                                Err(_) => {
-                                    error!("Connection limiter is closed");
-                                    break;
-                                }
+                        let permit = match try_acquire_connection_permit(
+                            &max_connections_unix,
+                            stats.as_ref(),
+                            "unix",
+                            None,
+                            accept_permit_timeout_ms,
+                        ) {
+                            ConnectionPermitDecision::Acquired(permit) => permit,
+                            ConnectionPermitDecision::Drop => {
+                                drop(stream);
+                                continue;
                             }
-                        } else {
-                            match tokio::time::timeout(
-                                Duration::from_millis(accept_permit_timeout_ms),
-                                max_connections_unix.clone().acquire_owned(),
-                            )
-                            .await
-                            {
-                                Ok(Ok(permit)) => permit,
-                                Ok(Err(_)) => {
-                                    error!("Connection limiter is closed");
-                                    break;
-                                }
-                                Err(_) => {
-                                    stats.increment_accept_permit_timeout_total();
-                                    debug!(
-                                        timeout_ms = accept_permit_timeout_ms,
-                                        "Dropping accepted unix connection: permit wait timeout"
-                                    );
-                                    drop(stream);
-                                    continue;
-                                }
-                            }
+                            ConnectionPermitDecision::Closed => break,
                         };
                         let conn_id =
                             unix_conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -410,37 +432,19 @@ pub(crate) fn spawn_tcp_accept_loops(
                         }
                         let accept_permit_timeout_ms =
                             config_rx.borrow().server.accept_permit_timeout_ms;
-                        let permit = if accept_permit_timeout_ms == 0 {
-                            match max_connections_tcp.clone().acquire_owned().await {
-                                Ok(permit) => permit,
-                                Err(_) => {
-                                    error!("Connection limiter is closed");
-                                    break;
-                                }
+                        let permit = match try_acquire_connection_permit(
+                            &max_connections_tcp,
+                            stats.as_ref(),
+                            "tcp",
+                            Some(peer_addr),
+                            accept_permit_timeout_ms,
+                        ) {
+                            ConnectionPermitDecision::Acquired(permit) => permit,
+                            ConnectionPermitDecision::Drop => {
+                                drop(stream);
+                                continue;
                             }
-                        } else {
-                            match tokio::time::timeout(
-                                Duration::from_millis(accept_permit_timeout_ms),
-                                max_connections_tcp.clone().acquire_owned(),
-                            )
-                            .await
-                            {
-                                Ok(Ok(permit)) => permit,
-                                Ok(Err(_)) => {
-                                    error!("Connection limiter is closed");
-                                    break;
-                                }
-                                Err(_) => {
-                                    stats.increment_accept_permit_timeout_total();
-                                    debug!(
-                                        peer = %peer_addr,
-                                        timeout_ms = accept_permit_timeout_ms,
-                                        "Dropping accepted connection: permit wait timeout"
-                                    );
-                                    drop(stream);
-                                    continue;
-                                }
-                            }
+                            ConnectionPermitDecision::Closed => break,
                         };
                         let config = config_rx.borrow_and_update().clone();
                         let stats = stats.clone();
