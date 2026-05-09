@@ -349,7 +349,7 @@ async fn run_telemt_core(
                 .init();
             _logging_guard = None;
         }
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "syslog"))]
         crate::logging::LogDestination::Syslog => {
             // Syslog: for OpenRC/FreeBSD
             let logging_opts = crate::logging::LoggingOptions {

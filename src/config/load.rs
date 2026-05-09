@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "shadowsocks-upstream")]
 use shadowsocks::config::ServerConfig as ShadowsocksServerConfig;
 use tracing::warn;
 
@@ -24,6 +25,7 @@ const MIN_MAX_CLIENT_FRAME_BYTES: usize = 4 * 1024;
 const MAX_MAX_CLIENT_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct LoadedConfig {
     pub(crate) config: ProxyConfig,
     pub(crate) source_files: Vec<PathBuf>,
@@ -246,6 +248,13 @@ fn validate_upstreams(config: &ProxyConfig) -> Result<()> {
         upstream.enabled && matches!(upstream.upstream_type, UpstreamType::Shadowsocks { .. })
     });
 
+    #[cfg(not(feature = "shadowsocks-upstream"))]
+    if has_enabled_shadowsocks {
+        return Err(ProxyError::Config(
+            "shadowsocks upstreams require the shadowsocks-upstream feature".to_string(),
+        ));
+    }
+
     if has_enabled_shadowsocks && config.general.use_middle_proxy {
         return Err(ProxyError::Config(
             "shadowsocks upstreams require general.use_middle_proxy = false".to_string(),
@@ -260,12 +269,21 @@ fn validate_upstreams(config: &ProxyConfig) -> Result<()> {
         }
 
         if let UpstreamType::Shadowsocks { url, .. } = &upstream.upstream_type {
-            let parsed = ShadowsocksServerConfig::from_url(url)
-                .map_err(|error| ProxyError::Config(format!("invalid shadowsocks url: {error}")))?;
-            if parsed.plugin().is_some() {
-                return Err(ProxyError::Config(
-                    "shadowsocks plugins are not supported".to_string(),
-                ));
+            #[cfg(feature = "shadowsocks-upstream")]
+            {
+                let parsed = ShadowsocksServerConfig::from_url(url).map_err(|error| {
+                    ProxyError::Config(format!("invalid shadowsocks url: {error}"))
+                })?;
+                if parsed.plugin().is_some() {
+                    return Err(ProxyError::Config(
+                        "shadowsocks plugins are not supported".to_string(),
+                    ));
+                }
+            }
+
+            #[cfg(not(feature = "shadowsocks-upstream"))]
+            {
+                let _ = url;
             }
         }
     }
@@ -3332,6 +3350,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "shadowsocks-upstream")]
     #[test]
     fn shadowsocks_upstream_url_loads_successfully() {
         let toml = format!(
@@ -3366,6 +3385,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "shadowsocks-upstream")]
     #[test]
     fn shadowsocks_requires_direct_mode() {
         let toml = format!(
@@ -3395,6 +3415,37 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(not(feature = "shadowsocks-upstream"))]
+    #[test]
+    fn shadowsocks_requires_feature_when_enabled() {
+        let toml = format!(
+            r#"
+            [general]
+            use_middle_proxy = false
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+
+            [[upstreams]]
+            type = "shadowsocks"
+            url = "{url}"
+            "#,
+            url = TEST_SHADOWSOCKS_URL,
+        );
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_shadowsocks_feature_reject_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("shadowsocks upstreams require the shadowsocks-upstream feature"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "shadowsocks-upstream")]
     #[test]
     fn invalid_shadowsocks_url_is_rejected() {
         let toml = r#"
@@ -3421,6 +3472,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(feature = "shadowsocks-upstream")]
     #[test]
     fn shadowsocks_plugins_are_rejected() {
         let toml = format!(

@@ -697,15 +697,7 @@ fn fd_usage_pct() -> Option<u8> {
 fn nofile_soft_limit() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let mut lim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
-        if rc != 0 {
-            return None;
-        }
-        return Some(lim.rlim_cur);
+        return rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
     }
     #[cfg(not(target_os = "linux"))]
     {

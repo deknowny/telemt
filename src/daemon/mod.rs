@@ -8,9 +8,8 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
-use nix::unistd::{self, ForkResult, Gid, Pid, Uid, chdir, close, fork, getpid, setsid};
+use nix::unistd::{self, ForkResult, Gid, Group, Pid, Uid, User, chdir, fork, getpid, setsid};
 use tracing::{debug, info, warn};
 
 /// Default PID file location.
@@ -151,29 +150,9 @@ fn redirect_stdio_to_devnull() -> Result<(), DaemonError> {
         .open("/dev/null")
         .map_err(DaemonError::DevNullFailed)?;
 
-    let devnull_fd = std::os::unix::io::AsRawFd::as_raw_fd(&devnull);
-
-    // Use libc::dup2 directly for redirecting standard file descriptors
-    // nix 0.31's dup2 requires OwnedFd which doesn't work well with stdio fds
-    unsafe {
-        // Redirect stdin (fd 0)
-        if libc::dup2(devnull_fd, 0) < 0 {
-            return Err(DaemonError::RedirectFailed(Errno::last()));
-        }
-        // Redirect stdout (fd 1)
-        if libc::dup2(devnull_fd, 1) < 0 {
-            return Err(DaemonError::RedirectFailed(Errno::last()));
-        }
-        // Redirect stderr (fd 2)
-        if libc::dup2(devnull_fd, 2) < 0 {
-            return Err(DaemonError::RedirectFailed(Errno::last()));
-        }
-    }
-
-    // Close original devnull fd if it's not one of the standard fds
-    if devnull_fd > 2 {
-        let _ = close(devnull_fd);
-    }
+    unistd::dup2_stdin(&devnull).map_err(DaemonError::RedirectFailed)?;
+    unistd::dup2_stdout(&devnull).map_err(DaemonError::RedirectFailed)?;
+    unistd::dup2_stderr(&devnull).map_err(DaemonError::RedirectFailed)?;
 
     Ok(())
 }
@@ -338,24 +317,16 @@ fn is_process_running(pid: i32) -> bool {
     nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok()
 }
 
-// macOS gates nix::unistd::setgroups differently in the current dependency set,
-// so call libc directly there while preserving the original nix path elsewhere.
 fn set_supplementary_groups(gid: Gid) -> Result<(), nix::Error> {
-    #[cfg(target_os = "macos")]
-    {
-        let groups = [gid.as_raw()];
-        let rc = unsafe {
-            libc::setgroups(
-                i32::try_from(groups.len()).expect("single supplementary group must fit in c_int"),
-                groups.as_ptr(),
-            )
-        };
-        if rc == 0 { Ok(()) } else { Err(Errno::last()) }
-    }
-
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         unistd::setgroups(&[gid])
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = gid;
+        Ok(())
     }
 }
 
@@ -436,48 +407,26 @@ pub fn drop_privileges(
 
 /// Looks up a user by name and returns their UID.
 fn lookup_user(name: &str) -> Result<Uid, DaemonError> {
-    // Use libc getpwnam
-    let c_name =
-        std::ffi::CString::new(name).map_err(|_| DaemonError::UserNotFound(name.to_string()))?;
-
-    unsafe {
-        let pwd = libc::getpwnam(c_name.as_ptr());
-        if pwd.is_null() {
-            Err(DaemonError::UserNotFound(name.to_string()))
-        } else {
-            Ok(Uid::from_raw((*pwd).pw_uid))
-        }
-    }
+    User::from_name(name)
+        .map_err(DaemonError::PrivilegeDrop)?
+        .map(|user| user.uid)
+        .ok_or_else(|| DaemonError::UserNotFound(name.to_string()))
 }
 
 /// Looks up a user's primary GID by username.
 fn lookup_user_primary_gid(name: &str) -> Result<Gid, DaemonError> {
-    let c_name =
-        std::ffi::CString::new(name).map_err(|_| DaemonError::UserNotFound(name.to_string()))?;
-
-    unsafe {
-        let pwd = libc::getpwnam(c_name.as_ptr());
-        if pwd.is_null() {
-            Err(DaemonError::UserNotFound(name.to_string()))
-        } else {
-            Ok(Gid::from_raw((*pwd).pw_gid))
-        }
-    }
+    User::from_name(name)
+        .map_err(DaemonError::PrivilegeDrop)?
+        .map(|user| user.gid)
+        .ok_or_else(|| DaemonError::UserNotFound(name.to_string()))
 }
 
 /// Looks up a group by name and returns its GID.
 fn lookup_group(name: &str) -> Result<Gid, DaemonError> {
-    let c_name =
-        std::ffi::CString::new(name).map_err(|_| DaemonError::GroupNotFound(name.to_string()))?;
-
-    unsafe {
-        let grp = libc::getgrnam(c_name.as_ptr());
-        if grp.is_null() {
-            Err(DaemonError::GroupNotFound(name.to_string()))
-        } else {
-            Ok(Gid::from_raw((*grp).gr_gid))
-        }
-    }
+    Group::from_name(name)
+        .map_err(DaemonError::PrivilegeDrop)?
+        .map(|group| group.gid)
+        .ok_or_else(|| DaemonError::GroupNotFound(name.to_string()))
 }
 
 /// Reads PID from a PID file.

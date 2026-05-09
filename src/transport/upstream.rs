@@ -6,6 +6,7 @@
 
 use rand::RngExt;
 use std::collections::{BTreeSet, HashMap};
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use crate::error::{ProxyError, Result};
 use crate::network::dns_overrides::{resolve_socket_addr, split_host_port};
 use crate::protocol::constants::{TG_DATACENTER_PORT, TG_DATACENTERS_V4, TG_DATACENTERS_V6};
 use crate::stats::Stats;
+#[cfg(feature = "shadowsocks-upstream")]
 use crate::transport::shadowsocks::{
     ShadowsocksStream, connect_shadowsocks, sanitize_shadowsocks_url,
 };
@@ -42,6 +44,29 @@ const HEALTH_CHECK_INTERVAL_SECS: u64 = 30;
 const HEALTH_CHECK_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Upstream is considered healthy when at least this many DC groups are reachable.
 const MIN_HEALTHY_DC_GROUPS: usize = 3;
+
+fn is_connect_in_progress(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::WouldBlock
+        || err.raw_os_error() == Some(nix::errno::Errno::EINPROGRESS as i32)
+}
+
+#[cfg(not(feature = "shadowsocks-upstream"))]
+fn shadowsocks_feature_error() -> ProxyError {
+    ProxyError::Config("shadowsocks upstreams require the shadowsocks-upstream feature".to_string())
+}
+
+fn describe_shadowsocks_address(url: &str) -> String {
+    #[cfg(feature = "shadowsocks-upstream")]
+    {
+        sanitize_shadowsocks_url(url).unwrap_or_else(|_| "invalid".to_string())
+    }
+
+    #[cfg(not(feature = "shadowsocks-upstream"))]
+    {
+        let _ = url;
+        "feature-disabled".to_string()
+    }
+}
 
 // ============= RTT Tracking =============
 
@@ -175,6 +200,7 @@ pub struct StartupPingResult {
 
 pub enum UpstreamStream {
     Tcp(TcpStream),
+    #[cfg(feature = "shadowsocks-upstream")]
     Shadowsocks(Box<ShadowsocksStream>),
 }
 
@@ -182,6 +208,7 @@ impl std::fmt::Debug for UpstreamStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Tcp(_) => f.write_str("UpstreamStream::Tcp(..)"),
+            #[cfg(feature = "shadowsocks-upstream")]
             Self::Shadowsocks(_) => f.write_str("UpstreamStream::Shadowsocks(..)"),
         }
     }
@@ -191,6 +218,7 @@ impl UpstreamStream {
     pub fn into_tcp(self) -> Result<TcpStream> {
         match self {
             Self::Tcp(stream) => Ok(stream),
+            #[cfg(feature = "shadowsocks-upstream")]
             Self::Shadowsocks(_) => Err(ProxyError::Config(
                 "shadowsocks upstreams are not supported when general.use_middle_proxy = true"
                     .to_string(),
@@ -207,6 +235,7 @@ impl AsyncRead for UpstreamStream {
     ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Self::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(feature = "shadowsocks-upstream")]
             Self::Shadowsocks(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
         }
     }
@@ -220,6 +249,7 @@ impl AsyncWrite for UpstreamStream {
     ) -> Poll<std::io::Result<usize>> {
         match self.get_mut() {
             Self::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(feature = "shadowsocks-upstream")]
             Self::Shadowsocks(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
         }
     }
@@ -227,6 +257,7 @@ impl AsyncWrite for UpstreamStream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Self::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(feature = "shadowsocks-upstream")]
             Self::Shadowsocks(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
         }
     }
@@ -234,6 +265,7 @@ impl AsyncWrite for UpstreamStream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Self::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(feature = "shadowsocks-upstream")]
             Self::Shadowsocks(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
         }
     }
@@ -471,7 +503,7 @@ impl UpstreamManager {
             UpstreamType::Socks5 { address, .. } => (UpstreamRouteKind::Socks5, address.clone()),
             UpstreamType::Shadowsocks { url, .. } => (
                 UpstreamRouteKind::Shadowsocks,
-                sanitize_shadowsocks_url(url).unwrap_or_else(|_| "invalid".to_string()),
+                describe_shadowsocks_address(url),
             ),
         }
     }
@@ -1091,9 +1123,7 @@ impl UpstreamManager {
                 socket.set_nonblocking(true)?;
                 match socket.connect(&target.into()) {
                     Ok(()) => {}
-                    Err(err)
-                        if err.raw_os_error() == Some(libc::EINPROGRESS)
-                            || err.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(err) if is_connect_in_progress(&err) => {}
                     Err(err) => return Err(ProxyError::Io(err)),
                 }
 
@@ -1147,9 +1177,7 @@ impl UpstreamManager {
                     socket.set_nonblocking(true)?;
                     match socket.connect(&proxy_addr.into()) {
                         Ok(()) => {}
-                        Err(err)
-                            if err.raw_os_error() == Some(libc::EINPROGRESS)
-                                || err.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(err) if is_connect_in_progress(&err) => {}
                         Err(err) => return Err(ProxyError::Io(err)),
                     }
 
@@ -1235,9 +1263,7 @@ impl UpstreamManager {
                     socket.set_nonblocking(true)?;
                     match socket.connect(&proxy_addr.into()) {
                         Ok(()) => {}
-                        Err(err)
-                            if err.raw_os_error() == Some(libc::EINPROGRESS)
-                                || err.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(err) if is_connect_in_progress(&err) => {}
                         Err(err) => return Err(ProxyError::Io(err)),
                     }
 
@@ -1304,19 +1330,29 @@ impl UpstreamManager {
                 ))
             }
             UpstreamType::Shadowsocks { url, interface } => {
-                let stream = connect_shadowsocks(url, interface, target, connect_timeout).await?;
-                let local_addr = stream.get_ref().local_addr().ok();
-                Ok((
-                    UpstreamStream::Shadowsocks(Box::new(stream)),
-                    UpstreamEgressInfo {
-                        upstream_id,
-                        route_kind: UpstreamRouteKind::Shadowsocks,
-                        local_addr,
-                        direct_bind_ip: None,
-                        socks_bound_addr: None,
-                        socks_proxy_addr: None,
-                    },
-                ))
+                #[cfg(feature = "shadowsocks-upstream")]
+                {
+                    let stream =
+                        connect_shadowsocks(url, interface, target, connect_timeout).await?;
+                    let local_addr = stream.get_ref().local_addr().ok();
+                    Ok((
+                        UpstreamStream::Shadowsocks(Box::new(stream)),
+                        UpstreamEgressInfo {
+                            upstream_id,
+                            route_kind: UpstreamRouteKind::Shadowsocks,
+                            local_addr,
+                            direct_bind_ip: None,
+                            socks_bound_addr: None,
+                            socks_proxy_addr: None,
+                        },
+                    ))
+                }
+
+                #[cfg(not(feature = "shadowsocks-upstream"))]
+                {
+                    let _ = (url, interface);
+                    Err(shadowsocks_feature_error())
+                }
             }
         }
     }
@@ -1380,8 +1416,7 @@ impl UpstreamManager {
                 UpstreamType::Socks4 { address, .. } => format!("socks4://{}", address),
                 UpstreamType::Socks5 { address, .. } => format!("socks5://{}", address),
                 UpstreamType::Shadowsocks { url, .. } => {
-                    let address =
-                        sanitize_shadowsocks_url(url).unwrap_or_else(|_| "invalid".to_string());
+                    let address = describe_shadowsocks_address(url);
                     format!("shadowsocks://{address}")
                 }
             };
@@ -2114,7 +2149,7 @@ mod tests {
     }
 
     #[test]
-    fn api_snapshot_reports_shadowsocks_as_sanitized_route() {
+    fn api_snapshot_reports_shadowsocks_route_state() {
         let manager = UpstreamManager::new(
             vec![UpstreamConfig {
                 upstream_type: UpstreamType::Shadowsocks {
@@ -2145,6 +2180,9 @@ mod tests {
             snapshot.upstreams[0].route_kind,
             UpstreamRouteKind::Shadowsocks
         );
+        #[cfg(feature = "shadowsocks-upstream")]
         assert_eq!(snapshot.upstreams[0].address, "127.0.0.1:8388");
+        #[cfg(not(feature = "shadowsocks-upstream"))]
+        assert_eq!(snapshot.upstreams[0].address, "feature-disabled");
     }
 }

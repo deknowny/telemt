@@ -70,34 +70,7 @@ pub fn configure_client_socket(
     // NOTE: iOS does not support TCP_USER_TIMEOUT - application-level timeout
     // is implemented in relay_bidirectional instead
     #[cfg(target_os = "linux")]
-    {
-        use std::io::{Error, ErrorKind};
-        use std::os::unix::io::AsRawFd;
-
-        let fd = stream.as_raw_fd();
-        let timeout_ms_u64 = ack_timeout_secs
-            .checked_mul(1000)
-            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "ack_timeout_secs is too large"))?;
-        let timeout_ms = i32::try_from(timeout_ms_u64).map_err(|_| {
-            Error::new(
-                ErrorKind::InvalidInput,
-                "ack_timeout_secs exceeds TCP_USER_TIMEOUT range",
-            )
-        })?;
-
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_USER_TIMEOUT,
-                &timeout_ms as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            return Err(Error::last_os_error());
-        }
-    }
+    socket.set_tcp_user_timeout(Some(Duration::from_secs(ack_timeout_secs)))?;
 
     Ok(())
 }
@@ -174,7 +147,6 @@ pub fn create_outgoing_socket_bound(addr: SocketAddr, bind_addr: Option<IpAddr>)
 #[cfg(target_os = "linux")]
 pub fn bind_outgoing_socket_to_device(socket: &Socket, device: &str) -> Result<()> {
     use std::io::{Error, ErrorKind};
-    use std::os::fd::AsRawFd;
 
     let name = device.trim();
     if name.is_empty() {
@@ -184,28 +156,15 @@ pub fn bind_outgoing_socket_to_device(socket: &Socket, device: &str) -> Result<(
         ));
     }
 
-    // The kernel expects an interface name buffer with a trailing NUL.
-    if name.len() >= libc::IFNAMSIZ {
+    // Linux interface names are capped at IFNAMSIZ (16 bytes including NUL).
+    if name.len() >= 16 {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             "bindtodevice exceeds IFNAMSIZ",
         ));
     }
-    let mut ifname = [0u8; libc::IFNAMSIZ];
-    ifname[..name.len()].copy_from_slice(name.as_bytes());
 
-    let rc = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_BINDTODEVICE,
-            ifname.as_ptr().cast::<libc::c_void>(),
-            (name.len() + 1) as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        return Err(Error::last_os_error());
-    }
+    socket.bind_device(Some(name.as_bytes()))?;
     debug!("Pinned outgoing socket to interface {}", name);
     Ok(())
 }

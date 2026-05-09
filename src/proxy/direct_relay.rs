@@ -152,7 +152,7 @@ fn open_unknown_dc_log_append(path: &Path) -> std::io::Result<std::fs::File> {
         OpenOptions::new()
             .create(true)
             .append(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(OFlag::O_NOFOLLOW.bits())
             .open(path)
     }
     #[cfg(not(unix))]
@@ -172,7 +172,7 @@ fn open_unknown_dc_log_append_anchored(
     {
         let parent = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags((OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
             .open(&path.allowed_parent)?;
 
         let oflags = OFlag::O_CREAT

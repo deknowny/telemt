@@ -9,10 +9,12 @@ use tokio::net::UdpSocket;
 use crate::config::{UpstreamConfig, UpstreamType};
 use crate::crypto::SecureRandom;
 use crate::error::ProxyError;
-use crate::transport::shadowsocks::sanitize_shadowsocks_url;
 use crate::transport::{UpstreamEgressInfo, UpstreamRouteKind};
 
 use super::MePool;
+
+#[cfg(feature = "shadowsocks-upstream")]
+use crate::transport::shadowsocks::sanitize_shadowsocks_url;
 
 type MePingGroup = (MePingFamily, i32, Vec<(IpAddr, u16)>);
 
@@ -83,6 +85,21 @@ fn format_direct_with_config(
         None
     } else {
         Some(format!("direct {}", direct_parts.join(" ")))
+    }
+}
+
+fn format_shadowsocks_route(url: &str) -> String {
+    #[cfg(feature = "shadowsocks-upstream")]
+    {
+        return sanitize_shadowsocks_url(url)
+            .map(|address| format!("shadowsocks://{address}"))
+            .unwrap_or_else(|_| "shadowsocks://invalid".to_string());
+    }
+
+    #[cfg(not(feature = "shadowsocks-upstream"))]
+    {
+        let _ = url;
+        "shadowsocks://feature-disabled".to_string()
     }
 }
 
@@ -249,9 +266,7 @@ pub async fn format_me_route(
             }
             UpstreamType::Socks4 { address, .. } => format!("socks4://{address}"),
             UpstreamType::Socks5 { address, .. } => format!("socks5://{address}"),
-            UpstreamType::Shadowsocks { url, .. } => sanitize_shadowsocks_url(url)
-                .map(|address| format!("shadowsocks://{address}"))
-                .unwrap_or_else(|_| "shadowsocks://invalid".to_string()),
+            UpstreamType::Shadowsocks { url, .. } => format_shadowsocks_route(url),
         };
     }
 

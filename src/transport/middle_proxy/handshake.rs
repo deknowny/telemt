@@ -1,13 +1,7 @@
-#[cfg(target_os = "linux")]
-use libc;
 use socket2::{SockRef, TcpKeepalive};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
-#[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, RawFd};
-#[cfg(target_os = "linux")]
-use std::os::raw::c_int;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -198,7 +192,7 @@ impl MePool {
             warn!(error = %e, "ME keepalive setup failed");
         }
         #[cfg(target_os = "linux")]
-        if let Err(e) = Self::configure_user_timeout(stream.as_raw_fd()) {
+        if let Err(e) = Self::configure_user_timeout(&stream) {
             warn!(error = %e, "ME TCP_USER_TIMEOUT setup failed");
         }
         Ok((stream, connect_ms, upstream_egress))
@@ -232,21 +226,8 @@ impl MePool {
     }
 
     #[cfg(target_os = "linux")]
-    fn configure_user_timeout(fd: RawFd) -> std::io::Result<()> {
-        let timeout_ms: c_int = 30_000;
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_USER_TIMEOUT,
-                &timeout_ms as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&timeout_ms) as libc::socklen_t,
-            )
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+    fn configure_user_timeout(stream: &TcpStream) -> std::io::Result<()> {
+        SockRef::from(stream).set_tcp_user_timeout(Some(Duration::from_secs(30)))
     }
 
     /// Perform full ME RPC handshake on an established TCP stream.

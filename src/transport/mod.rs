@@ -2,6 +2,7 @@
 
 pub mod pool;
 pub mod proxy_protocol;
+#[cfg(feature = "shadowsocks-upstream")]
 pub mod shadowsocks;
 pub mod socket;
 pub mod socks;

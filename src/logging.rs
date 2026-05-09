@@ -20,7 +20,7 @@ pub enum LogDestination {
     #[default]
     Stderr,
     /// Log to syslog (Unix only).
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "syslog"))]
     Syslog,
     /// Log to a file with optional rotation.
     File {
@@ -83,7 +83,7 @@ pub fn init_logging(
             (filter_handle, LoggingGuard::noop())
         }
 
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "syslog"))]
         LogDestination::Syslog => {
             // Use a custom fmt layer that writes to syslog
             let fmt_layer = fmt::Layer::default()
@@ -138,17 +138,17 @@ pub fn init_logging(
 }
 
 /// Syslog writer for tracing.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "syslog"))]
 #[derive(Clone, Copy)]
 struct SyslogMakeWriter;
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "syslog"))]
 #[derive(Clone, Copy)]
 struct SyslogWriter {
     priority: libc::c_int,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "syslog"))]
 impl SyslogMakeWriter {
     fn new() -> Self {
         // Open syslog connection on first use
@@ -164,7 +164,7 @@ impl SyslogMakeWriter {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "syslog"))]
 fn syslog_priority_for_level(level: &tracing::Level) -> libc::c_int {
     match *level {
         tracing::Level::ERROR => libc::LOG_ERR,
@@ -175,7 +175,7 @@ fn syslog_priority_for_level(level: &tracing::Level) -> libc::c_int {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "syslog"))]
 impl std::io::Write for SyslogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         // Convert to C string, stripping newlines
@@ -206,7 +206,7 @@ impl std::io::Write for SyslogWriter {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "syslog"))]
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SyslogMakeWriter {
     type Writer = SyslogWriter;
 
@@ -228,7 +228,7 @@ pub fn parse_log_destination(args: &[String]) -> LogDestination {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "syslog"))]
             "--syslog" => {
                 return LogDestination::Syslog;
             }
@@ -306,7 +306,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "syslog"))]
     #[test]
     fn test_parse_log_destination_syslog() {
         let args = vec!["--syslog".to_string()];
@@ -316,7 +316,7 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "syslog"))]
     #[test]
     fn test_syslog_priority_for_level_mapping() {
         assert_eq!(
