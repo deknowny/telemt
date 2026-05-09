@@ -25,6 +25,8 @@ use crate::transport::{ListenOptions, create_listener};
 
 // Keeps `/metrics` response size bounded when per-user telemetry is enabled.
 const USER_LABELED_METRICS_MAX_USERS: usize = 4096;
+const METRICS_BIND_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const METRICS_BIND_RETRY_MAX: Duration = Duration::from_secs(10);
 
 pub async fn serve(
     port: u16,
@@ -49,24 +51,18 @@ pub async fn serve(
             }
         };
         let is_ipv6 = addr.is_ipv6();
-        match bind_metrics_listener(addr, is_ipv6, listen_backlog) {
-            Ok(listener) => {
-                info!("Metrics endpoint: http://{}/metrics and /beobachten", addr);
-                serve_listener(
-                    listener,
-                    stats,
-                    beobachten,
-                    shared_state,
-                    ip_tracker,
-                    config_rx,
-                    whitelist,
-                )
-                .await;
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to bind metrics on {}", addr);
-            }
-        }
+        let listener = bind_metrics_listener_with_retry(addr, is_ipv6, listen_backlog).await;
+        info!("Metrics endpoint: http://{}/metrics and /beobachten", addr);
+        serve_listener(
+            listener,
+            stats,
+            beobachten,
+            shared_state,
+            ip_tracker,
+            config_rx,
+            whitelist,
+        )
+        .await;
         return;
     }
 
@@ -164,6 +160,31 @@ fn bind_metrics_listener(
     };
     let socket = create_listener(addr, &options)?;
     TcpListener::from_std(socket.into())
+}
+
+async fn bind_metrics_listener_with_retry(
+    addr: SocketAddr,
+    ipv6_only: bool,
+    listen_backlog: u32,
+) -> TcpListener {
+    let mut retry_delay = METRICS_BIND_RETRY_INITIAL;
+    loop {
+        match bind_metrics_listener(addr, ipv6_only, listen_backlog) {
+            Ok(listener) => {
+                return listener;
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    retry_in_ms = retry_delay.as_millis(),
+                    "Failed to bind metrics on {}; retrying",
+                    addr
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(METRICS_BIND_RETRY_MAX);
+            }
+        }
+    }
 }
 
 async fn serve_listener(
