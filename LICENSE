@@ -9,21 +9,6 @@ persons to whom the Software is furnished to do so, provided that all
 copyright notices, license terms, and conditions set forth in this License
 are preserved and complied with.
 
-### Official Translations
-
-The canonical version of this License is the English version.
-Official translations are provided for informational purposes only
-and for convenience, and do not have legal force. In case of any
-discrepancy, the English version of this License shall prevail
-
-/----------------------------------------------------------\
-| Language    | Location                                   |
-|-------------|--------------------------------------------|
-| English     | docs/LICENSE/TELEMT-LICENSE.en.md          |
-| German      | docs/LICENSE/TELEMT-LICENSE.de.md          |
-| Russian     | docs/LICENSE/TELEMT-LICENSE.ru.md          |
-\----------------------------------------------------------/
-
 ### License Versioning Policy
 
 This License is version 3 of the TELEMT Public License.
