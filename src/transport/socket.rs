@@ -110,6 +110,18 @@ pub fn set_linger_zero(stream: &TcpStream) -> Result<()> {
     Ok(())
 }
 
+/// Set SO_LINGER(0) on an already split socket fd before the last half drops.
+#[cfg(unix)]
+pub fn set_linger_zero_fd(fd: std::os::unix::io::RawFd) -> Result<()> {
+    use std::os::unix::io::BorrowedFd;
+    // SAFETY: the fd is still open — the caller guarantees the
+    // TcpStream (or its split halves) is alive.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let socket = socket2::SockRef::from(&borrowed);
+    socket.set_linger(Some(Duration::ZERO))?;
+    Ok(())
+}
+
 /// Restore default linger behaviour (graceful FIN) on a socket
 /// identified by its raw file descriptor.  Safe to call after
 /// `TcpStream::into_split()` because the fd remains valid until

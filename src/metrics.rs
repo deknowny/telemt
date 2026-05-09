@@ -1304,6 +1304,21 @@ async fn render_metrics(
 
     let _ = writeln!(
         out,
+        "# HELP telemt_relay_rst_on_close_total Middle-relay sessions switched to TCP RST on abnormal close"
+    );
+    let _ = writeln!(out, "# TYPE telemt_relay_rst_on_close_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_relay_rst_on_close_total {}",
+        if me_allows_normal {
+            stats.get_relay_rst_on_close_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
         "# HELP telemt_relay_pressure_evict_total Middle-relay sessions evicted under resource pressure"
     );
     let _ = writeln!(out, "# TYPE telemt_relay_pressure_evict_total counter");
@@ -3532,6 +3547,7 @@ mod tests {
         stats.increment_me_idle_close_by_peer_total();
         stats.increment_relay_idle_soft_mark_total();
         stats.increment_relay_idle_hard_close_total();
+        stats.increment_relay_rst_on_close_total();
         stats.increment_relay_pressure_evict_total();
         stats.increment_relay_protocol_desync_close_total();
         stats.increment_me_d2c_batches_total();
@@ -3594,6 +3610,7 @@ mod tests {
         assert!(output.contains("telemt_me_idle_close_by_peer_total 1"));
         assert!(output.contains("telemt_relay_idle_soft_mark_total 1"));
         assert!(output.contains("telemt_relay_idle_hard_close_total 1"));
+        assert!(output.contains("telemt_relay_rst_on_close_total 1"));
         assert!(output.contains("telemt_relay_pressure_evict_total 1"));
         assert!(output.contains("telemt_relay_protocol_desync_close_total 1"));
         assert!(output.contains("telemt_me_d2c_batches_total 1"));
@@ -3683,6 +3700,7 @@ mod tests {
         assert!(output.contains("# TYPE telemt_me_idle_close_by_peer_total counter"));
         assert!(output.contains("# TYPE telemt_relay_idle_soft_mark_total counter"));
         assert!(output.contains("# TYPE telemt_relay_idle_hard_close_total counter"));
+        assert!(output.contains("# TYPE telemt_relay_rst_on_close_total counter"));
         assert!(output.contains("# TYPE telemt_relay_pressure_evict_total counter"));
         assert!(output.contains("# TYPE telemt_relay_protocol_desync_close_total counter"));
         assert!(output.contains("# TYPE telemt_me_d2c_batches_total counter"));

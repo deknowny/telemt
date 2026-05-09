@@ -167,8 +167,8 @@ pub enum RstOnCloseMode {
     #[default]
     Off,
     /// SO_LINGER(0) on accept; cleared after successful auth.
-    /// Pre-handshake failures (scanners, DPI, timeouts) send RST;
-    /// authenticated relay sessions close gracefully with FIN.
+    /// Pre-handshake failures and abnormal relayed closes (idle timeout,
+    /// reset, pressure eviction) send RST; normal relay EOF closes with FIN.
     Errors,
     /// SO_LINGER(0) on accept, never cleared — all closes send RST.
     Always,
@@ -963,8 +963,8 @@ pub struct GeneralConfig {
 
     /// RST-on-close mode for accepted client sockets.
     /// `off`    — normal FIN on all closes (default).
-    /// `errors` — SO_LINGER(0) on accept, cleared after successful auth;
-    ///            pre-handshake failures send RST, relayed sessions close gracefully.
+    /// `errors` — pre-handshake failures and abnormal relayed closes send RST;
+    ///            normal relayed EOF closes gracefully.
     /// `always` — SO_LINGER(0) on accept, never cleared; all closes send RST.
     #[serde(default)]
     pub rst_on_close: RstOnCloseMode,

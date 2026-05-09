@@ -3,6 +3,8 @@ use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
@@ -12,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf, split
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::config::ProxyConfig;
+use crate::config::{ProxyConfig, RstOnCloseMode};
 use crate::crypto::SecureRandom;
 use crate::error::{ProxyError, Result};
 use crate::protocol::constants::*;
@@ -260,6 +262,9 @@ where
         session_id,
         SocketAddr::from(([0, 0, 0, 0], config.server.port)),
         ProxySharedState::new(),
+        #[cfg(unix)]
+        None,
+        RstOnCloseMode::Off,
     )
     .await
 }
@@ -278,6 +283,8 @@ pub(crate) async fn handle_via_direct_with_shared<R, W>(
     session_id: u64,
     local_addr: SocketAddr,
     shared: Arc<ProxySharedState>,
+    #[cfg(unix)] _client_raw_fd: Option<RawFd>,
+    _rst_on_close: RstOnCloseMode,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,

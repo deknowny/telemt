@@ -7,6 +7,8 @@ use std::future::Future;
 use std::hash::Hasher;
 use std::hash::{BuildHasher, Hash};
 use std::net::{IpAddr, SocketAddr};
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -16,7 +18,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
 
-use crate::config::{ConntrackPressureProfile, ProxyConfig};
+use crate::config::{ConntrackPressureProfile, ProxyConfig, RstOnCloseMode};
 use crate::crypto::SecureRandom;
 use crate::error::{ProxyError, Result};
 use crate::protocol::constants::{secure_padding_len, *};
@@ -1150,6 +1152,8 @@ pub(crate) async fn handle_via_middle_proxy<R, W>(
     route_snapshot: RouteCutoverState,
     session_id: u64,
     shared: Arc<ProxySharedState>,
+    #[cfg(unix)] client_raw_fd: Option<RawFd>,
+    rst_on_close: RstOnCloseMode,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -1842,6 +1846,17 @@ where
         }
     }
 
+    let main_close_reason = classify_conntrack_close_reason(&main_result);
+    #[cfg(unix)]
+    maybe_enable_rst_for_abnormal_relay_close(
+        rst_on_close,
+        client_raw_fd,
+        main_close_reason,
+        conn_id,
+        forensics.trace_id,
+        stats.as_ref(),
+    );
+
     drop(c2me_tx);
     let c2me_result = c2me_sender
         .await
@@ -1903,6 +1918,52 @@ where
         pool_snapshot.allocated.saturating_sub(pool_snapshot.pooled),
     );
     result
+}
+
+#[cfg(unix)]
+fn maybe_enable_rst_for_abnormal_relay_close(
+    rst_on_close: RstOnCloseMode,
+    client_raw_fd: Option<RawFd>,
+    close_reason: ConntrackCloseReason,
+    conn_id: u64,
+    trace_id: u64,
+    stats: &Stats,
+) {
+    if !matches!(rst_on_close, RstOnCloseMode::Errors) {
+        return;
+    }
+    if !matches!(
+        close_reason,
+        ConntrackCloseReason::Timeout
+            | ConntrackCloseReason::Pressure
+            | ConntrackCloseReason::Reset
+    ) {
+        return;
+    }
+    let Some(fd) = client_raw_fd else {
+        return;
+    };
+
+    match crate::transport::socket::set_linger_zero_fd(fd) {
+        Ok(()) => {
+            stats.increment_relay_rst_on_close_total();
+            debug!(
+                conn_id,
+                trace_id = format_args!("0x{:016x}", trace_id),
+                reason = ?close_reason,
+                "Enabled TCP RST for abnormal middle-relay close"
+            );
+        }
+        Err(error) => {
+            debug!(
+                conn_id,
+                trace_id = format_args!("0x{:016x}", trace_id),
+                reason = ?close_reason,
+                error = %error,
+                "Failed to enable TCP RST for abnormal middle-relay close"
+            );
+        }
+    }
 }
 
 fn classify_conntrack_close_reason(result: &Result<()>) -> ConntrackCloseReason {
@@ -2003,7 +2064,7 @@ where
                     if mark_relay_idle_candidate_in(shared, forensics.conn_id) {
                         stats.increment_relay_idle_soft_mark_total();
                     }
-                    info!(
+                    debug!(
                         trace_id = format_args!("0x{:016x}", forensics.trace_id),
                         conn_id = forensics.conn_id,
                         user = %forensics.user,

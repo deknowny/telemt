@@ -78,7 +78,7 @@ impl Drop for UserConnectionReservation {
     }
 }
 
-use crate::config::ProxyConfig;
+use crate::config::{ProxyConfig, RstOnCloseMode};
 use crate::crypto::SecureRandom;
 use crate::error::{HandshakeResult, ProxyError, Result, StreamError};
 use crate::ip_tracker::UserIpTracker;
@@ -721,6 +721,9 @@ where
                     route_runtime.clone(),
                     local_addr, real_peer, ip_tracker.clone(),
                     shared.clone(),
+                    #[cfg(unix)]
+                    None,
+                    RstOnCloseMode::Off,
                 ),
             )))
         } else {
@@ -783,6 +786,9 @@ where
                     real_peer,
                     ip_tracker.clone(),
                     shared.clone(),
+                    #[cfg(unix)]
+                    None,
+                    RstOnCloseMode::Off,
                 )
             )))
         }
@@ -1341,6 +1347,9 @@ impl RunningClientHandler {
                 peer,
                 self.ip_tracker,
                 self.shared,
+                #[cfg(unix)]
+                Some(self.raw_fd),
+                self.rst_on_close,
             ),
         )))
     }
@@ -1425,6 +1434,9 @@ impl RunningClientHandler {
                 peer,
                 self.ip_tracker,
                 self.shared,
+                #[cfg(unix)]
+                Some(self.raw_fd),
+                self.rst_on_close,
             ),
         )))
     }
@@ -1468,6 +1480,9 @@ impl RunningClientHandler {
             peer_addr,
             ip_tracker,
             ProxySharedState::new(),
+            #[cfg(unix)]
+            None,
+            RstOnCloseMode::Off,
         )
         .await
     }
@@ -1487,6 +1502,8 @@ impl RunningClientHandler {
         peer_addr: SocketAddr,
         ip_tracker: Arc<UserIpTracker>,
         shared: Arc<ProxySharedState>,
+        #[cfg(unix)] raw_fd: Option<std::os::unix::io::RawFd>,
+        rst_on_close: RstOnCloseMode,
     ) -> Result<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -1530,6 +1547,9 @@ impl RunningClientHandler {
                     route_snapshot,
                     session_id,
                     shared.clone(),
+                    #[cfg(unix)]
+                    raw_fd,
+                    rst_on_close,
                 )
                 .await
             } else {
@@ -1548,6 +1568,9 @@ impl RunningClientHandler {
                     session_id,
                     local_addr,
                     shared.clone(),
+                    #[cfg(unix)]
+                    raw_fd,
+                    rst_on_close,
                 )
                 .await
             }
@@ -1567,6 +1590,9 @@ impl RunningClientHandler {
                 session_id,
                 local_addr,
                 shared.clone(),
+                #[cfg(unix)]
+                raw_fd,
+                rst_on_close,
             )
             .await
         };
