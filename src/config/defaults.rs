@@ -128,15 +128,15 @@ pub(crate) fn default_relay_idle_policy_v2_enabled() -> bool {
 }
 
 pub(crate) fn default_relay_client_idle_soft_secs() -> u64 {
-    120
+    600
 }
 
 pub(crate) fn default_relay_client_idle_hard_secs() -> u64 {
-    360
+    1800
 }
 
 pub(crate) fn default_relay_idle_grace_after_downstream_activity_secs() -> u64 {
-    30
+    120
 }
 
 pub(crate) fn default_connect_timeout() -> u64 {

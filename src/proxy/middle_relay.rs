@@ -56,6 +56,8 @@ const C2ME_SENDER_FAIRNESS_BUDGET: usize = 32;
 const C2ME_QUEUED_BYTE_PERMIT_UNIT: usize = 16 * 1024;
 const C2ME_QUEUED_PERMITS_PER_SLOT: usize = 4;
 const RELAY_IDLE_IO_POLL_MAX: Duration = Duration::from_secs(1);
+const RELAY_IDLE_SOFT_JITTER_MAX: Duration = Duration::from_secs(60);
+const RELAY_IDLE_HARD_JITTER_MAX: Duration = Duration::from_secs(120);
 const TINY_FRAME_DEBT_PER_TINY: u32 = 8;
 const TINY_FRAME_DEBT_LIMIT: u32 = 512;
 #[cfg(test)]
@@ -348,6 +350,18 @@ impl RelayClientIdleState {
     fn on_client_tiny_frame(&mut self, now: Instant) {
         self.last_client_frame_at = now;
     }
+}
+
+fn relay_idle_jitter(conn_id: u64, idle: Duration, max_jitter: Duration) -> Duration {
+    let idle_secs = idle.as_secs();
+    let max_secs = max_jitter.as_secs().min(idle_secs / 4);
+    if max_secs == 0 {
+        return Duration::ZERO;
+    }
+
+    let mixed =
+        conn_id ^ conn_id.rotate_left(17) ^ conn_id.rotate_right(11) ^ 0x9e37_79b9_7f4a_7c15;
+    Duration::from_secs(mixed % (max_secs + 1))
 }
 
 impl MeD2cFlushPolicy {
@@ -2032,8 +2046,10 @@ where
             idle_state: &RelayClientIdleState,
             session_started_at: Instant,
             last_downstream_activity_ms: u64,
+            hard_jitter: Duration,
         ) -> Instant {
-            let mut deadline = idle_state.last_client_frame_at + idle_policy.hard_idle;
+            let mut deadline =
+                idle_state.last_client_frame_at + idle_policy.hard_idle + hard_jitter;
             if idle_policy.grace_after_downstream_activity.is_zero() {
                 return deadline;
             }
@@ -2050,15 +2066,30 @@ where
         }
 
         let mut filled = 0usize;
+        let soft_jitter = relay_idle_jitter(
+            forensics.conn_id,
+            idle_policy.soft_idle,
+            RELAY_IDLE_SOFT_JITTER_MAX,
+        );
+        let hard_jitter = relay_idle_jitter(
+            forensics.conn_id,
+            idle_policy.hard_idle,
+            RELAY_IDLE_HARD_JITTER_MAX,
+        );
         while filled < buf.len() {
             let timeout_window = if idle_policy.enabled {
                 let now = Instant::now();
                 let downstream_ms = last_downstream_activity_ms.load(Ordering::Relaxed);
-                let hard_deadline =
-                    hard_deadline(idle_policy, idle_state, session_started_at, downstream_ms);
+                let hard_deadline = hard_deadline(
+                    idle_policy,
+                    idle_state,
+                    session_started_at,
+                    downstream_ms,
+                    hard_jitter,
+                );
                 if !idle_state.soft_idle_marked
                     && now.saturating_duration_since(idle_state.last_client_frame_at)
-                        >= idle_policy.soft_idle
+                        >= idle_policy.soft_idle + soft_jitter
                 {
                     idle_state.soft_idle_marked = true;
                     if mark_relay_idle_candidate_in(shared, forensics.conn_id) {
@@ -2071,12 +2102,15 @@ where
                         read_label,
                         soft_idle_secs = idle_policy.soft_idle.as_secs(),
                         hard_idle_secs = idle_policy.hard_idle.as_secs(),
+                        soft_jitter_secs = soft_jitter.as_secs(),
+                        hard_jitter_secs = hard_jitter.as_secs(),
                         grace_secs = idle_policy.grace_after_downstream_activity.as_secs(),
                         "Middle-relay soft idle mark"
                     );
                 }
 
-                let soft_deadline = idle_state.last_client_frame_at + idle_policy.soft_idle;
+                let soft_deadline =
+                    idle_state.last_client_frame_at + idle_policy.soft_idle + soft_jitter;
                 let next_deadline = if idle_state.soft_idle_marked {
                     hard_deadline
                 } else {
@@ -2113,8 +2147,13 @@ where
                 Err(_) => {
                     let now = Instant::now();
                     let downstream_ms = last_downstream_activity_ms.load(Ordering::Relaxed);
-                    let hard_deadline =
-                        hard_deadline(idle_policy, idle_state, session_started_at, downstream_ms);
+                    let hard_deadline = hard_deadline(
+                        idle_policy,
+                        idle_state,
+                        session_started_at,
+                        downstream_ms,
+                        hard_jitter,
+                    );
                     if now >= hard_deadline {
                         clear_relay_idle_candidate_in(shared, forensics.conn_id);
                         stats.increment_relay_idle_hard_close_total();
@@ -2135,6 +2174,8 @@ where
                             downstream_idle_secs,
                             soft_idle_secs = idle_policy.soft_idle.as_secs(),
                             hard_idle_secs = idle_policy.hard_idle.as_secs(),
+                            soft_jitter_secs = soft_jitter.as_secs(),
+                            hard_jitter_secs = hard_jitter.as_secs(),
                             grace_secs = idle_policy.grace_after_downstream_activity.as_secs(),
                             "Middle-relay hard idle close"
                         );
