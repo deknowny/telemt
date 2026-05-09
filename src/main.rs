@@ -34,8 +34,8 @@ mod transport;
 mod util;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    #[cfg(any(feature = "https-control-plane", feature = "tls-rustls-fetch"))]
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    #[cfg(feature = "tls-pure-rust")]
+    let _ = rustls_rustcrypto::provider().install_default();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = cli::parse_command(&args);

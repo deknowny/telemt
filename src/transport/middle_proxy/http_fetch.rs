@@ -41,10 +41,16 @@ pub(crate) struct HttpsGetResponse {
 }
 
 #[cfg(feature = "https-control-plane")]
+fn install_tls_provider() {
+    let _ = rustls_rustcrypto::provider().install_default();
+}
+
+#[cfg(feature = "https-control-plane")]
 fn build_tls_client_config() -> Arc<rustls::ClientConfig> {
+    install_tls_provider();
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let provider = rustls::crypto::ring::default_provider();
+    let provider = rustls_rustcrypto::provider();
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .expect("HTTPS fetch rustls protocol versions must be valid")
@@ -137,11 +143,53 @@ async fn connect_https_transport(
 }
 
 #[cfg(feature = "https-control-plane")]
+async fn https_get_via_reqwest(url: &str) -> Result<HttpsGetResponse> {
+    install_tls_provider();
+    let client = reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .no_proxy()
+        .user_agent("telemt-middle-proxy/1")
+        .build()
+        .map_err(|e| ProxyError::Proxy(format!("build HTTPS client failed for {url}: {e}")))?;
+
+    let response = client
+        .get(url)
+        .header("connection", "close")
+        .send()
+        .await
+        .map_err(|e| ProxyError::Proxy(format!("HTTP request failed for {url}: {e}")))?;
+
+    let status = response.status().as_u16();
+    let date_header = response
+        .headers()
+        .get("date")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| ProxyError::Proxy(format!("HTTP body read failed for {url}: {e}")))?
+        .to_vec();
+
+    Ok(HttpsGetResponse {
+        status,
+        date_header,
+        body,
+    })
+}
+
+#[cfg(feature = "https-control-plane")]
 pub(crate) async fn https_get(
     url: &str,
     upstream: Option<Arc<UpstreamManager>>,
 ) -> Result<HttpsGetResponse> {
     let (host, port, path_and_query) = extract_host_port_path(url)?;
+
+    if upstream.is_none() && resolve_socket_addr(&host, port).is_none() {
+        return https_get_via_reqwest(url).await;
+    }
+
     let stream = connect_https_transport(&host, port, upstream).await?;
 
     let server_name = ServerName::try_from(host.clone())
