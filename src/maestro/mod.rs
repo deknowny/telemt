@@ -31,6 +31,8 @@ use crate::api;
 use crate::config::{LogLevel, ProxyConfig};
 use crate::conntrack_control;
 use crate::crypto::SecureRandom;
+#[cfg(not(feature = "direct-dc"))]
+use crate::error::ProxyError;
 use crate::ip_tracker::UserIpTracker;
 use crate::network::probe::{decide_network_capabilities, log_probe_result, run_probe};
 use crate::proxy::route_mode::{RelayRouteMode, RouteRuntimeController};
@@ -679,22 +681,33 @@ async fn run_telemt_core(
         startup_tracker.set_degraded(false).await;
         info!("Transport: Middle-End Proxy - all DC-over-RPC");
     } else {
-        let _ = use_middle_proxy;
-        use_middle_proxy = false;
-        // Make runtime config reflect direct-only mode for handlers.
-        config.general.use_middle_proxy = false;
-        startup_tracker.set_transport_mode("direct").await;
-        startup_tracker.set_degraded(true).await;
-        if me2dc_fallback {
-            startup_tracker
-                .set_me_status(StartupMeStatus::Failed, "fallback_to_direct")
-                .await;
-        } else {
-            startup_tracker
-                .set_me_status(StartupMeStatus::Skipped, "skipped")
-                .await;
+        #[cfg(not(feature = "direct-dc"))]
+        {
+            return Err(Box::new(ProxyError::Config(
+                "Middle-End pool is unavailable and Direct-DC fallback is not compiled in"
+                    .to_string(),
+            )));
         }
-        info!("Transport: Direct DC - TCP - standard DC-over-TCP");
+
+        #[cfg(feature = "direct-dc")]
+        {
+            let _ = use_middle_proxy;
+            use_middle_proxy = false;
+            // Make runtime config reflect direct-only mode for handlers.
+            config.general.use_middle_proxy = false;
+            startup_tracker.set_transport_mode("direct").await;
+            startup_tracker.set_degraded(true).await;
+            if me2dc_fallback {
+                startup_tracker
+                    .set_me_status(StartupMeStatus::Failed, "fallback_to_direct")
+                    .await;
+            } else {
+                startup_tracker
+                    .set_me_status(StartupMeStatus::Skipped, "skipped")
+                    .await;
+            }
+            info!("Transport: Direct DC - TCP - standard DC-over-TCP");
+        }
     }
 
     // Freeze config after possible fallback decision

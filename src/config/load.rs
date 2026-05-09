@@ -243,6 +243,36 @@ fn sanitize_ad_tag(ad_tag: &mut Option<String>) {
     }
 }
 
+#[allow(unused_variables)]
+fn apply_compile_time_feature_policy(config: &mut ProxyConfig) -> Result<()> {
+    #[cfg(not(feature = "direct-dc"))]
+    {
+        if !config.general.use_middle_proxy {
+            return Err(ProxyError::Config(
+                "general.use_middle_proxy=false requires the `direct-dc` feature".to_string(),
+            ));
+        }
+
+        if config.general.me2dc_fallback || config.general.me2dc_fast {
+            warn!(
+                "Direct-DC fallback is not compiled in; forcing general.me2dc_fallback=false and general.me2dc_fast=false"
+            );
+            config.general.me2dc_fallback = false;
+            config.general.me2dc_fast = false;
+        }
+    }
+
+    #[cfg(not(feature = "me-hardswap"))]
+    {
+        if config.general.hardswap {
+            warn!("ME hardswap is not compiled in; forcing general.hardswap=false");
+            config.general.hardswap = false;
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_upstreams(config: &ProxyConfig) -> Result<()> {
     let has_enabled_shadowsocks = config.upstreams.iter().any(|upstream| {
         upstream.enabled && matches!(upstream.upstream_type, UpstreamType::Shadowsocks { .. })
@@ -1338,6 +1368,8 @@ impl ProxyConfig {
                 "Auto-enabled me_secret_atomic_snapshot for middle proxy mode to keep KDF key_selector/secret coherent"
             );
         }
+
+        apply_compile_time_feature_policy(&mut config)?;
 
         validate_network_cfg(&mut config.network)?;
         crate::network::dns_overrides::validate_entries(&config.network.dns_overrides)?;

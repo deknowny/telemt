@@ -92,6 +92,7 @@ use crate::transport::middle_proxy::MePool;
 use crate::transport::socket::normalize_ip;
 use crate::transport::{UpstreamManager, configure_client_socket, parse_proxy_protocol};
 
+#[cfg(feature = "direct-dc")]
 use crate::proxy::direct_relay::handle_via_direct_with_shared;
 use crate::proxy::handshake::{
     HandshakeSuccess, handle_mtproto_handshake_with_shared, handle_tls_handshake_with_shared,
@@ -1491,7 +1492,7 @@ impl RunningClientHandler {
         client_reader: CryptoReader<R>,
         client_writer: CryptoWriter<W>,
         success: HandshakeSuccess,
-        upstream_manager: Arc<UpstreamManager>,
+        _upstream_manager: Arc<UpstreamManager>,
         stats: Arc<Stats>,
         config: Arc<ProxyConfig>,
         buffer_pool: Arc<BufferPool>,
@@ -1553,7 +1554,54 @@ impl RunningClientHandler {
                 )
                 .await
             } else {
-                warn!("use_middle_proxy=true but MePool not initialized, falling back to direct");
+                #[cfg(not(feature = "direct-dc"))]
+                {
+                    warn!(
+                        "use_middle_proxy=true but MePool is not initialized and Direct-DC fallback is not compiled in"
+                    );
+                    Err(ProxyError::Config(
+                        "Direct-DC fallback is not compiled in".to_string(),
+                    ))
+                }
+                #[cfg(feature = "direct-dc")]
+                {
+                    let upstream_manager = _upstream_manager.clone();
+                    warn!(
+                        "use_middle_proxy=true but MePool not initialized, falling back to direct"
+                    );
+                    handle_via_direct_with_shared(
+                        client_reader,
+                        client_writer,
+                        success,
+                        upstream_manager,
+                        stats.clone(),
+                        config,
+                        buffer_pool,
+                        rng,
+                        route_runtime.subscribe(),
+                        route_snapshot,
+                        session_id,
+                        local_addr,
+                        shared.clone(),
+                        #[cfg(unix)]
+                        raw_fd,
+                        rst_on_close,
+                    )
+                    .await
+                }
+            }
+        } else {
+            #[cfg(not(feature = "direct-dc"))]
+            {
+                warn!("Direct-DC route selected but Direct-DC support is not compiled in");
+                Err(ProxyError::Config(
+                    "Direct-DC support is not compiled in".to_string(),
+                ))
+            }
+            #[cfg(feature = "direct-dc")]
+            {
+                let upstream_manager = _upstream_manager;
+                // Direct mode (original behavior)
                 handle_via_direct_with_shared(
                     client_reader,
                     client_writer,
@@ -1574,27 +1622,6 @@ impl RunningClientHandler {
                 )
                 .await
             }
-        } else {
-            // Direct mode (original behavior)
-            handle_via_direct_with_shared(
-                client_reader,
-                client_writer,
-                success,
-                upstream_manager,
-                stats.clone(),
-                config,
-                buffer_pool,
-                rng,
-                route_runtime.subscribe(),
-                route_snapshot,
-                session_id,
-                local_addr,
-                shared.clone(),
-                #[cfg(unix)]
-                raw_fd,
-                rst_on_close,
-            )
-            .await
         };
         user_limit_reservation.release().await;
         relay_result

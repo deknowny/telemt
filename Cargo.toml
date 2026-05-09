@@ -5,9 +5,11 @@ edition = "2024"
 
 [features]
 default = ["https-control-plane"]
+direct-dc = []
 hot-reload = ["dep:notify"]
 https-control-plane = ["tls-pure-rust", "dep:reqwest"]
 http-probes = []
+me-hardswap = []
 redteam_offline_expected_fail = []
 shadowsocks-upstream = ["dep:shadowsocks"]
 syslog = ["dep:libc"]
