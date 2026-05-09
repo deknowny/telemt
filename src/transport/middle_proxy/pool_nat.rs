@@ -367,29 +367,28 @@ impl MePool {
 }
 
 async fn fetch_public_ipv4_with_retry() -> Result<Option<Ipv4Addr>> {
-    let providers = [
-        "https://checkip.amazonaws.com",
-        "http://v4.ident.me",
-        "http://ipv4.icanhazip.com",
-    ];
-    for url in providers {
-        if let Ok(Some(ip)) = fetch_public_ipv4_once(url).await {
-            return Ok(Some(ip));
-        }
+    #[cfg(not(feature = "http-probes"))]
+    {
+        return Ok(None);
     }
-    Ok(None)
+
+    #[cfg(feature = "http-probes")]
+    {
+        let providers = ["http://v4.ident.me", "http://ipv4.icanhazip.com"];
+        for url in providers {
+            if let Ok(Some(ip)) = fetch_public_ipv4_once(url).await {
+                return Ok(Some(ip));
+            }
+        }
+        Ok(None)
+    }
 }
 
+#[cfg(feature = "http-probes")]
 async fn fetch_public_ipv4_once(url: &str) -> Result<Option<Ipv4Addr>> {
-    let res = reqwest::get(url)
+    let text = crate::util::http::get_text(url, Duration::from_secs(5))
         .await
         .map_err(|e| ProxyError::Proxy(format!("public IP detection request failed: {e}")))?;
 
-    let text = res
-        .text()
-        .await
-        .map_err(|e| ProxyError::Proxy(format!("public IP detection read failed: {e}")))?;
-
-    let ip = text.trim().parse().ok();
-    Ok(ip)
+    Ok(text.trim().parse().ok())
 }

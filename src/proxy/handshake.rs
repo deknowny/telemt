@@ -4,7 +4,6 @@
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use hmac::{Hmac, Mac};
 #[cfg(test)]
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
@@ -23,7 +22,7 @@ use tracing::{debug, info, trace, warn};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::{ProxyConfig, UnknownSniAction};
-use crate::crypto::{AesCtr, SecureRandom, sha256};
+use crate::crypto::{AesCtr, SecureRandom, sha256, sha256_hmac_parts};
 use crate::error::{HandshakeResult, ProxyError};
 use crate::protocol::constants::*;
 use crate::protocol::tls;
@@ -33,7 +32,6 @@ use crate::stream::{CryptoReader, CryptoWriter, FakeTlsReader, FakeTlsWriter};
 use crate::tls_front::{TlsFrontCache, emulator};
 #[cfg(test)]
 use rand::RngExt;
-use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 const ACCESS_SECRET_BYTES: usize = 16;
@@ -57,8 +55,6 @@ const OVERLOAD_CANDIDATE_BUDGET_HINTED: usize = 16;
 const OVERLOAD_CANDIDATE_BUDGET_UNHINTED: usize = 8;
 const EXPENSIVE_INVALID_SCAN_SATURATION_THRESHOLD: usize = 64;
 const RECENT_USER_RING_SCAN_LIMIT: usize = 32;
-
-type HmacSha256 = Hmac<Sha256>;
 
 #[cfg(test)]
 const AUTH_PROBE_BACKOFF_BASE_MS: u64 = 1;
@@ -308,11 +304,15 @@ fn parse_tls_auth_material(
 }
 
 fn compute_tls_hmac_zeroed_digest(secret: &[u8], handshake: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(&handshake[..tls::TLS_DIGEST_POS]);
-    mac.update(&[0u8; tls::TLS_DIGEST_LEN]);
-    mac.update(&handshake[tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN..]);
-    mac.finalize().into_bytes().into()
+    const ZERO_DIGEST: [u8; tls::TLS_DIGEST_LEN] = [0u8; tls::TLS_DIGEST_LEN];
+    sha256_hmac_parts(
+        secret,
+        &[
+            &handshake[..tls::TLS_DIGEST_POS],
+            &ZERO_DIGEST,
+            &handshake[tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN..],
+        ],
+    )
 }
 
 fn validate_tls_secret_candidate(

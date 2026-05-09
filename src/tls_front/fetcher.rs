@@ -2,48 +2,114 @@
 
 use dashmap::DashMap;
 use std::net::SocketAddr;
+#[cfg(feature = "tls-rustls-fetch")]
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
+use tokio::time::error::Elapsed;
 use tokio::time::timeout;
+#[cfg(feature = "tls-rustls-fetch")]
 use tokio_rustls::TlsConnector;
+#[cfg(feature = "tls-rustls-fetch")]
 use tokio_rustls::client::TlsStream;
 use tracing::{debug, warn};
 
+#[cfg(feature = "tls-rustls-fetch")]
 use rustls::client::ClientConfig;
+#[cfg(feature = "tls-rustls-fetch")]
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+#[cfg(feature = "tls-rustls-fetch")]
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+#[cfg(feature = "tls-rustls-fetch")]
 use rustls::{DigitallySignedStruct, Error as RustlsError};
 use x25519_dalek::{X25519_BASEPOINT_BYTES, x25519};
 
+#[cfg(feature = "tls-rustls-fetch")]
 use x509_parser::certificate::X509Certificate;
+#[cfg(feature = "tls-rustls-fetch")]
 use x509_parser::prelude::FromDer;
 
 use crate::config::TlsFetchProfile;
 use crate::crypto::{SecureRandom, sha256};
+use crate::error::ProxyError;
 use crate::network::dns_overrides::resolve_socket_addr;
 use crate::protocol::constants::{
     TLS_RECORD_APPLICATION, TLS_RECORD_CHANGE_CIPHER, TLS_RECORD_HANDSHAKE,
 };
+#[cfg(feature = "tls-rustls-fetch")]
+use crate::tls_front::types::{ParsedCertificateInfo, TlsCertPayload};
 use crate::tls_front::types::{
-    ParsedCertificateInfo, ParsedServerHello, TlsBehaviorProfile, TlsCertPayload, TlsExtension,
-    TlsFetchResult, TlsProfileSource,
+    ParsedServerHello, TlsBehaviorProfile, TlsExtension, TlsFetchResult, TlsProfileSource,
 };
 use crate::transport::UpstreamStream;
 use crate::transport::proxy_protocol::{ProxyProtocolV1Builder, ProxyProtocolV2Builder};
 
+type FetchResult<T> = std::result::Result<T, TlsFetchError>;
+
+#[derive(Debug, Error)]
+pub enum TlsFetchError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("operation timed out")]
+    Timeout(#[from] Elapsed),
+
+    #[error("upstream route DNS resolution failed for {host}:{port}: {source}")]
+    RouteDns {
+        host: String,
+        port: u16,
+        source: std::io::Error,
+    },
+
+    #[error("upstream route connect failed for {host}:{port}: {source}")]
+    RouteConnect {
+        host: String,
+        port: u16,
+        source: ProxyError,
+    },
+
+    #[error("upstream route resolution produced no usable address for {host}:{port}")]
+    RouteNoAddress { host: String, port: u16 },
+
+    #[error("ServerHello not received")]
+    ServerHelloMissing,
+
+    #[cfg(feature = "tls-rustls-fetch")]
+    #[error("rustls error: {0}")]
+    Rustls(#[from] RustlsError),
+
+    #[cfg(feature = "tls-rustls-fetch")]
+    #[error("invalid SNI: {sni}")]
+    InvalidSni { sni: String },
+
+    #[error("TLS fetch strict-route failure")]
+    StrictRouteFailure,
+
+    #[error("TLS fetch total budget exhausted")]
+    TotalBudgetExhausted,
+
+    #[cfg(feature = "tls-rustls-fetch")]
+    #[error("TLS fetch failed (raw: {raw}; rustls: {rustls})")]
+    RawAndRustlsFailed {
+        raw: Box<TlsFetchError>,
+        rustls: Box<TlsFetchError>,
+    },
+}
+
 /// No-op verifier: accept any certificate (we only need lengths and metadata).
+#[cfg(feature = "tls-rustls-fetch")]
 #[derive(Debug)]
 struct NoVerify;
 
+#[cfg(feature = "tls-rustls-fetch")]
 impl ServerCertVerifier for NoVerify {
     fn verify_server_cert(
         &self,
@@ -52,7 +118,7 @@ impl ServerCertVerifier for NoVerify {
         _server_name: &ServerName<'_>,
         _ocsp: &[u8],
         _now: UnixTime,
-    ) -> Result<ServerCertVerified, RustlsError> {
+    ) -> std::result::Result<ServerCertVerified, RustlsError> {
         Ok(ServerCertVerified::assertion())
     }
 
@@ -61,7 +127,7 @@ impl ServerCertVerifier for NoVerify {
         _message: &[u8],
         _cert: &CertificateDer<'_>,
         _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RustlsError> {
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
         Ok(HandshakeSignatureValid::assertion())
     }
 
@@ -70,7 +136,7 @@ impl ServerCertVerifier for NoVerify {
         _message: &[u8],
         _cert: &CertificateDer<'_>,
         _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RustlsError> {
+    ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
         Ok(HandshakeSignatureValid::assertion())
     }
 
@@ -134,6 +200,7 @@ struct ProfileCacheValue {
     updated_at: Instant,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FetchErrorKind {
     Connect,
@@ -209,37 +276,44 @@ fn profile_cache_key(
     }
 }
 
-fn classify_fetch_error(err: &anyhow::Error) -> FetchErrorKind {
-    for cause in err.chain() {
-        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            return match io.kind() {
-                std::io::ErrorKind::TimedOut => FetchErrorKind::Timeout,
-                std::io::ErrorKind::UnexpectedEof => FetchErrorKind::EarlyEof,
-                std::io::ErrorKind::ConnectionRefused
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::NotConnected
-                | std::io::ErrorKind::AddrNotAvailable => FetchErrorKind::Connect,
-                _ => FetchErrorKind::Other,
-            };
+fn classify_fetch_error(err: &TlsFetchError) -> FetchErrorKind {
+    fn classify_io(error: &std::io::Error) -> FetchErrorKind {
+        match error.kind() {
+            std::io::ErrorKind::TimedOut => FetchErrorKind::Timeout,
+            std::io::ErrorKind::UnexpectedEof => FetchErrorKind::EarlyEof,
+            std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::AddrNotAvailable => FetchErrorKind::Connect,
+            _ => FetchErrorKind::Other,
         }
     }
 
-    let message = err.to_string().to_lowercase();
-    if message.contains("upstream route") {
-        FetchErrorKind::Route
-    } else if message.contains("serverhello not received") {
-        FetchErrorKind::ServerHelloMissing
-    } else if message.contains("alert") {
-        FetchErrorKind::TlsAlert
-    } else if message.contains("parse") {
-        FetchErrorKind::Parse
-    } else if message.contains("timed out") || message.contains("deadline has elapsed") {
-        FetchErrorKind::Timeout
-    } else if message.contains("eof") {
-        FetchErrorKind::EarlyEof
-    } else {
-        FetchErrorKind::Other
+    match err {
+        TlsFetchError::Io(error) => classify_io(error),
+        TlsFetchError::Timeout(_) => FetchErrorKind::Timeout,
+        TlsFetchError::RouteDns { .. }
+        | TlsFetchError::RouteConnect { .. }
+        | TlsFetchError::RouteNoAddress { .. }
+        | TlsFetchError::StrictRouteFailure => FetchErrorKind::Route,
+        TlsFetchError::ServerHelloMissing => FetchErrorKind::ServerHelloMissing,
+        TlsFetchError::TotalBudgetExhausted => FetchErrorKind::Timeout,
+        #[cfg(feature = "tls-rustls-fetch")]
+        TlsFetchError::Rustls(error) => {
+            let message = error.to_string().to_lowercase();
+            if message.contains("alert") {
+                FetchErrorKind::TlsAlert
+            } else if message.contains("parse") {
+                FetchErrorKind::Parse
+            } else {
+                FetchErrorKind::Other
+            }
+        }
+        #[cfg(feature = "tls-rustls-fetch")]
+        TlsFetchError::InvalidSni { .. } => FetchErrorKind::Other,
+        #[cfg(feature = "tls-rustls-fetch")]
+        TlsFetchError::RawAndRustlsFailed { raw, .. } => classify_fetch_error(raw),
     }
 }
 
@@ -340,6 +414,7 @@ fn remember_profile_success_with_cap(
     );
 }
 
+#[cfg(feature = "tls-rustls-fetch")]
 fn build_client_config(alpn_protocols: &[&[u8]]) -> Arc<ClientConfig> {
     let root = rustls::RootCertStore::empty();
 
@@ -673,7 +748,7 @@ fn gen_key_share(rng: &SecureRandom, deterministic: bool, seed: &str) -> [u8; 32
     x25519(scalar, X25519_BASEPOINT_BYTES)
 }
 
-async fn read_tls_record<S>(stream: &mut S) -> Result<(u8, Vec<u8>)>
+async fn read_tls_record<S>(stream: &mut S) -> FetchResult<(u8, Vec<u8>)>
 where
     S: AsyncRead + Unpin,
 {
@@ -779,6 +854,7 @@ fn derive_behavior_profile(records: &[(u8, Vec<u8>)]) -> TlsBehaviorProfile {
     }
 }
 
+#[cfg(feature = "tls-rustls-fetch")]
 fn parse_cert_info(certs: &[CertificateDer<'static>]) -> Option<ParsedCertificateInfo> {
     let first = certs.first()?;
     let (_rem, cert) = X509Certificate::from_der(first.as_ref()).ok()?;
@@ -825,6 +901,7 @@ fn parse_cert_info(certs: &[CertificateDer<'static>]) -> Option<ParsedCertificat
     })
 }
 
+#[cfg(any(test, feature = "tls-rustls-fetch"))]
 fn u24_bytes(value: usize) -> Option<[u8; 3]> {
     if value > 0x00ff_ffff {
         return None;
@@ -840,7 +917,7 @@ async fn connect_with_dns_override(
     host: &str,
     port: u16,
     connect_timeout: Duration,
-) -> Result<TcpStream> {
+) -> FetchResult<TcpStream> {
     if let Some(addr) = resolve_socket_addr(host, port) {
         return Ok(timeout(connect_timeout, TcpStream::connect(addr)).await??);
     }
@@ -854,7 +931,7 @@ async fn connect_tcp_with_upstream(
     upstream: Option<std::sync::Arc<crate::transport::UpstreamManager>>,
     scope: Option<&str>,
     strict_route: bool,
-) -> Result<UpstreamStream> {
+) -> FetchResult<UpstreamStream> {
     if let Some(manager) = upstream {
         let resolved = if let Some(addr) = resolve_socket_addr(host, port) {
             Some(addr)
@@ -863,9 +940,11 @@ async fn connect_tcp_with_upstream(
                 Ok(mut addrs) => addrs.find(|a| a.is_ipv4()),
                 Err(e) => {
                     if strict_route {
-                        return Err(anyhow!(
-                            "upstream route DNS resolution failed for {host}:{port}: {e}"
-                        ));
+                        return Err(TlsFetchError::RouteDns {
+                            host: host.to_string(),
+                            port,
+                            source: e,
+                        });
                     }
                     warn!(
                         host = %host,
@@ -884,9 +963,11 @@ async fn connect_tcp_with_upstream(
                 Ok(stream) => return Ok(stream),
                 Err(e) => {
                     if strict_route {
-                        return Err(anyhow!(
-                            "upstream route connect failed for {host}:{port}: {e}"
-                        ));
+                        return Err(TlsFetchError::RouteConnect {
+                            host: host.to_string(),
+                            port,
+                            source: e,
+                        });
                     }
                     warn!(
                         host = %host,
@@ -898,9 +979,10 @@ async fn connect_tcp_with_upstream(
                 }
             }
         } else if strict_route {
-            return Err(anyhow!(
-                "upstream route resolution produced no usable address for {host}:{port}"
-            ));
+            return Err(TlsFetchError::RouteNoAddress {
+                host: host.to_string(),
+                port,
+            });
         }
     }
     Ok(UpstreamStream::Tcp(
@@ -954,6 +1036,7 @@ fn build_tls_fetch_proxy_header(
     }
 }
 
+#[cfg(any(test, feature = "tls-rustls-fetch"))]
 fn encode_tls13_certificate_message(cert_chain_der: &[Vec<u8>]) -> Option<Vec<u8>> {
     if cert_chain_der.is_empty() {
         return None;
@@ -989,7 +1072,7 @@ async fn fetch_via_raw_tls_stream<S>(
     profile: TlsFetchProfile,
     grease_enabled: bool,
     deterministic: bool,
-) -> Result<TlsFetchResult>
+) -> FetchResult<TlsFetchResult>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1032,7 +1115,7 @@ where
         }
     }
 
-    let parsed = server_hello.ok_or_else(|| anyhow!("ServerHello not received"))?;
+    let parsed = server_hello.ok_or(TlsFetchError::ServerHelloMissing)?;
     let behavior_profile = derive_behavior_profile(&records);
     let mut app_sizes = behavior_profile.app_data_record_sizes.clone();
     app_sizes.extend_from_slice(&behavior_profile.ticket_record_sizes);
@@ -1068,7 +1151,7 @@ async fn fetch_via_raw_tls(
     profile: TlsFetchProfile,
     grease_enabled: bool,
     deterministic: bool,
-) -> Result<TlsFetchResult> {
+) -> FetchResult<TlsFetchResult> {
     #[cfg(unix)]
     if let Some(sock_path) = unix_sock {
         match timeout(connect_timeout, UnixStream::connect(sock_path)).await {
@@ -1128,13 +1211,14 @@ async fn fetch_via_raw_tls(
     .await
 }
 
+#[cfg(feature = "tls-rustls-fetch")]
 async fn fetch_via_rustls_stream<S>(
     mut stream: S,
     host: &str,
     sni: &str,
     proxy_header: Option<Vec<u8>>,
     alpn_protocols: &[&[u8]],
-) -> Result<TlsFetchResult>
+) -> FetchResult<TlsFetchResult>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1149,7 +1233,9 @@ where
 
     let server_name = ServerName::try_from(sni.to_owned())
         .or_else(|_| ServerName::try_from(host.to_owned()))
-        .map_err(|_| RustlsError::General("invalid SNI".into()))?;
+        .map_err(|_| TlsFetchError::InvalidSni {
+            sni: sni.to_string(),
+        })?;
 
     let tls_stream: TlsStream<S> = connector.connect(server_name, stream).await?;
 
@@ -1219,6 +1305,7 @@ where
     })
 }
 
+#[cfg(feature = "tls-rustls-fetch")]
 async fn fetch_via_rustls(
     host: &str,
     port: u16,
@@ -1230,7 +1317,7 @@ async fn fetch_via_rustls(
     unix_sock: Option<&str>,
     strict_route: bool,
     alpn_protocols: &[&[u8]],
-) -> Result<TlsFetchResult> {
+) -> FetchResult<TlsFetchResult> {
     #[cfg(unix)]
     if let Some(sock_path) = unix_sock {
         match timeout(connect_timeout, UnixStream::connect(sock_path)).await {
@@ -1283,7 +1370,7 @@ pub async fn fetch_real_tls_with_strategy(
     scope: Option<&str>,
     proxy_protocol: u8,
     unix_sock: Option<&str>,
-) -> Result<TlsFetchResult> {
+) -> FetchResult<TlsFetchResult> {
     let attempt_timeout = strategy.attempt_timeout.max(Duration::from_millis(1));
     let total_budget = strategy.total_budget.max(Duration::from_millis(1));
     let started_at = Instant::now();
@@ -1299,7 +1386,7 @@ pub async fn fetch_real_tls_with_strategy(
     let profiles = order_profiles(strategy, Some(&cache_key), started_at);
 
     let mut raw_result = None;
-    let mut raw_last_error: Option<anyhow::Error> = None;
+    let mut raw_last_error: Option<TlsFetchError> = None;
     let mut raw_last_error_kind = FetchErrorKind::Other;
     let mut selected_profile = None;
 
@@ -1368,22 +1455,32 @@ pub async fn fetch_real_tls_with_strategy(
         if let Some(err) = raw_last_error {
             return Err(err);
         }
-        return Err(anyhow!("TLS fetch strict-route failure"));
+        return Err(TlsFetchError::StrictRouteFailure);
     }
 
     let elapsed = started_at.elapsed();
     if elapsed >= total_budget {
         return match raw_result {
             Some(raw) => Ok(raw),
-            None => {
-                Err(raw_last_error.unwrap_or_else(|| anyhow!("TLS fetch total budget exhausted")))
-            }
+            None => Err(raw_last_error.unwrap_or(TlsFetchError::TotalBudgetExhausted)),
         };
     }
 
+    #[cfg(not(feature = "tls-rustls-fetch"))]
+    {
+        return match raw_result {
+            Some(raw) => Ok(raw),
+            None => Err(raw_last_error.unwrap_or(TlsFetchError::TotalBudgetExhausted)),
+        };
+    }
+
+    #[cfg(feature = "tls-rustls-fetch")]
     let rustls_timeout = attempt_timeout.min(total_budget - elapsed);
+    #[cfg(feature = "tls-rustls-fetch")]
     let rustls_profile = selected_profile.unwrap_or(TlsFetchProfile::ModernChromeLike);
+    #[cfg(feature = "tls-rustls-fetch")]
     let rustls_alpn_protocols = profile_alpn(rustls_profile);
+    #[cfg(feature = "tls-rustls-fetch")]
     debug!(
         sni = %sni,
         profile = rustls_profile.as_str(),
@@ -1392,6 +1489,7 @@ pub async fn fetch_real_tls_with_strategy(
         deterministic = strategy.deterministic,
         "TLS fetch ClientHello params (rustls)"
     );
+    #[cfg(feature = "tls-rustls-fetch")]
     let rustls_result = fetch_via_rustls(
         host,
         port,
@@ -1406,6 +1504,7 @@ pub async fn fetch_real_tls_with_strategy(
     )
     .await;
 
+    #[cfg(feature = "tls-rustls-fetch")]
     match rustls_result {
         Ok(rustls) => {
             if let Some(mut raw) = raw_result {
@@ -1423,7 +1522,10 @@ pub async fn fetch_real_tls_with_strategy(
                 warn!(sni = %sni, error = %err, "Rustls cert fetch failed, using raw TLS metadata only");
                 Ok(raw)
             } else if let Some(raw_err) = raw_last_error {
-                Err(anyhow!("TLS fetch failed (raw: {raw_err}; rustls: {err})"))
+                Err(TlsFetchError::RawAndRustlsFailed {
+                    raw: Box::new(raw_err),
+                    rustls: Box::new(err),
+                })
             } else {
                 Err(err)
             }
@@ -1442,7 +1544,7 @@ pub async fn fetch_real_tls(
     scope: Option<&str>,
     proxy_protocol: u8,
     unix_sock: Option<&str>,
-) -> Result<TlsFetchResult> {
+) -> FetchResult<TlsFetchResult> {
     let strategy = TlsFetchStrategy::single_attempt(connect_timeout);
     fetch_real_tls_with_strategy(
         host,
@@ -1462,10 +1564,12 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::{Duration, Instant};
 
+    #[cfg(feature = "tls-rustls-fetch")]
+    use super::fetch_via_rustls_stream;
     use super::{
         ProfileCacheValue, TlsFetchStrategy, build_client_hello, build_tls_fetch_proxy_header,
-        derive_behavior_profile, encode_tls13_certificate_message, fetch_via_rustls_stream,
-        order_profiles, profile_alpn, profile_cache, profile_cache_key,
+        derive_behavior_profile, encode_tls13_certificate_message, order_profiles, profile_alpn,
+        profile_cache, profile_cache_key,
     };
     use crate::config::TlsFetchProfile;
     use crate::crypto::SecureRandom;
@@ -1473,6 +1577,7 @@ mod tests {
         TLS_RECORD_APPLICATION, TLS_RECORD_CHANGE_CIPHER, TLS_RECORD_HANDSHAKE,
     };
     use crate::tls_front::types::TlsProfileSource;
+    #[cfg(feature = "tls-rustls-fetch")]
     use tokio::io::AsyncReadExt;
 
     struct ParsedClientHelloForTest {
@@ -1548,6 +1653,7 @@ mod tests {
         out
     }
 
+    #[cfg(feature = "tls-rustls-fetch")]
     async fn capture_rustls_client_hello_record(
         alpn_protocols: &'static [&'static [u8]],
     ) -> Vec<u8> {
@@ -1863,6 +1969,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tls-rustls-fetch")]
     #[tokio::test(flavor = "current_thread")]
     async fn test_rustls_client_hello_alpn_matches_selected_profile() {
         for profile in [

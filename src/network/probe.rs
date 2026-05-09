@@ -235,31 +235,29 @@ pub async fn run_probe(
 }
 
 async fn detect_public_ipv4_http(urls: &[String]) -> Option<Ipv4Addr> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .ok()?;
-
-    for url in urls {
-        let response = match client.get(url).send().await {
-            Ok(response) => response,
-            Err(_) => continue,
-        };
-
-        let body = match response.text().await {
-            Ok(body) => body,
-            Err(_) => continue,
-        };
-
-        let Ok(ip) = body.trim().parse::<Ipv4Addr>() else {
-            continue;
-        };
-        if !is_bogon_v4(ip) {
-            return Some(ip);
-        }
+    #[cfg(not(feature = "http-probes"))]
+    {
+        let _ = urls;
+        return None;
     }
 
-    None
+    #[cfg(feature = "http-probes")]
+    {
+        for url in urls {
+            let body = match crate::util::http::get_text(url, Duration::from_secs(3)).await {
+                Ok(body) => body,
+                Err(_) => continue,
+            };
+
+            let Ok(ip) = body.trim().parse::<Ipv4Addr>() else {
+                continue;
+            };
+            if !is_bogon_v4(ip) {
+                return Some(ip);
+            }
+        }
+        None
+    }
 }
 
 fn collect_stun_servers(config: &NetworkConfig) -> Vec<String> {

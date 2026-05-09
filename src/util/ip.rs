@@ -1,6 +1,7 @@
 //! IP Addr Detect
 
 use std::net::{IpAddr, UdpSocket};
+#[cfg(feature = "http-probes")]
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -141,15 +142,19 @@ fn is_private_ip(ip: IpAddr) -> bool {
 /// Fetch IP from URL
 #[allow(dead_code)]
 async fn fetch_ip(url: &str) -> Option<IpAddr> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .ok()?;
+    #[cfg(feature = "http-probes")]
+    {
+        let text = crate::util::http::get_text(url, Duration::from_secs(5))
+            .await
+            .ok()?;
+        return text.trim().parse().ok();
+    }
 
-    let response = client.get(url).send().await.ok()?;
-    let text = response.text().await.ok()?;
-
-    text.trim().parse().ok()
+    #[cfg(not(feature = "http-probes"))]
+    {
+        let _ = url;
+        None
+    }
 }
 
 /// Synchronous IP detection (for startup)

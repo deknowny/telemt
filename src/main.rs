@@ -34,7 +34,7 @@ mod transport;
 mod util;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // Install rustls crypto provider early
+    #[cfg(any(feature = "https-control-plane", feature = "tls-rustls-fetch"))]
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let args: Vec<String> = std::env::args().skip(1).collect();

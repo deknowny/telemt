@@ -11,13 +11,12 @@
 //! Static analysis tools (CodeQL, cargo-audit) may flag them — the
 //! usages are intentional and protocol-mandated.
 
-use hmac::{Hmac, Mac};
 use md5::Md5;
 use sha1::Sha1;
 use sha2::Digest;
 use sha2::Sha256;
 
-type HmacSha256 = Hmac<Sha256>;
+const SHA256_BLOCK_SIZE: usize = 64;
 
 /// SHA-256
 pub fn sha256(data: &[u8]) -> [u8; 32] {
@@ -28,9 +27,39 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 
 /// SHA-256 HMAC
 pub fn sha256_hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().into()
+    sha256_hmac_parts(key, &[data])
+}
+
+/// SHA-256 HMAC over several slices without concatenating them first.
+pub fn sha256_hmac_parts(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    let mut key_block = [0u8; SHA256_BLOCK_SIZE];
+    if key.len() > SHA256_BLOCK_SIZE {
+        key_block[..32].copy_from_slice(&sha256(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut inner_pad = [0x36u8; SHA256_BLOCK_SIZE];
+    let mut outer_pad = [0x5cu8; SHA256_BLOCK_SIZE];
+    for (inner, (outer, key_byte)) in inner_pad
+        .iter_mut()
+        .zip(outer_pad.iter_mut().zip(key_block.iter()))
+    {
+        *inner ^= key_byte;
+        *outer ^= key_byte;
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    for part in parts {
+        inner.update(part);
+    }
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    outer.finalize().into()
 }
 
 /// SHA-1 — **protocol-required** by Telegram Middle Proxy key derivation.
@@ -162,5 +191,27 @@ mod tests {
             hex::encode(digest),
             "934f5facdafd65a44d5c2df90d2f35ddc81faaaeb337949dfeef817c8a7c1e00"
         );
+    }
+
+    #[test]
+    fn sha256_hmac_matches_rfc4231_vector() {
+        let key = [0x0bu8; 20];
+        let digest = sha256_hmac(&key, b"Hi There");
+        assert_eq!(
+            hex::encode(digest),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+    }
+
+    #[test]
+    fn sha256_hmac_parts_matches_single_buffer() {
+        let key = b"secret";
+        let whole = b"left-middle-right";
+        let parts = [
+            b"left-".as_slice(),
+            b"middle".as_slice(),
+            b"-right".as_slice(),
+        ];
+        assert_eq!(sha256_hmac(key, whole), sha256_hmac_parts(key, &parts));
     }
 }

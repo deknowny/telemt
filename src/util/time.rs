@@ -2,7 +2,9 @@
 
 use chrono::{DateTime, Utc};
 use std::time::Duration;
-use tracing::{debug, error, warn};
+#[cfg(feature = "https-control-plane")]
+use tracing::warn;
+use tracing::{debug, error};
 
 #[allow(dead_code)]
 const TIME_SYNC_URL: &str = "https://core.telegram.org/getProxySecret";
@@ -22,18 +24,15 @@ pub struct TimeSyncResult {
 /// Check time synchronization with Telegram servers
 #[allow(dead_code)]
 pub async fn check_time_sync() -> Option<TimeSyncResult> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .ok()?;
+    let _ = Duration::from_secs(10);
+    let _ = TIME_SYNC_URL;
+    debug!("Time sync HTTPS probe is disabled in the trimmed production build");
+    None
+}
 
-    let response = client.get(TIME_SYNC_URL).send().await.ok()?;
-
-    // Get Date header
-    let date_header = response.headers().get("date")?;
-    let date_str = date_header.to_str().ok()?;
-
-    // Parse date
+#[cfg(feature = "https-control-plane")]
+#[allow(dead_code)]
+fn time_sync_result_from_date_header(date_str: &str) -> Option<TimeSyncResult> {
     let server_time = DateTime::parse_from_rfc2822(date_str)
         .ok()?
         .with_timezone(&Utc);

@@ -1,21 +1,37 @@
 use std::sync::Arc;
+#[cfg(feature = "https-control-plane")]
 use std::time::Duration;
 
+#[cfg(feature = "https-control-plane")]
 use http_body_util::{BodyExt, Empty};
+#[cfg(feature = "https-control-plane")]
 use hyper::header::{CONNECTION, DATE, HOST, USER_AGENT};
+#[cfg(feature = "https-control-plane")]
 use hyper::{Method, Request};
+#[cfg(feature = "https-control-plane")]
 use hyper_util::rt::TokioIo;
+#[cfg(feature = "https-control-plane")]
 use rustls::pki_types::ServerName;
+#[cfg(feature = "https-control-plane")]
 use tokio::net::TcpStream;
+#[cfg(feature = "https-control-plane")]
 use tokio::time::timeout;
+#[cfg(feature = "https-control-plane")]
 use tokio_rustls::TlsConnector;
+#[cfg(feature = "https-control-plane")]
 use tracing::debug;
 
 use crate::error::{ProxyError, Result};
+#[cfg(feature = "https-control-plane")]
 use crate::network::dns_overrides::resolve_socket_addr;
+#[cfg(not(feature = "https-control-plane"))]
+use crate::transport::UpstreamManager;
+#[cfg(feature = "https-control-plane")]
 use crate::transport::{UpstreamManager, UpstreamStream};
 
+#[cfg(feature = "https-control-plane")]
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "https-control-plane")]
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) struct HttpsGetResponse {
@@ -24,6 +40,7 @@ pub(crate) struct HttpsGetResponse {
     pub(crate) body: Vec<u8>,
 }
 
+#[cfg(feature = "https-control-plane")]
 fn build_tls_client_config() -> Arc<rustls::ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -36,6 +53,7 @@ fn build_tls_client_config() -> Arc<rustls::ClientConfig> {
     Arc::new(config)
 }
 
+#[cfg(feature = "https-control-plane")]
 fn extract_host_port_path(url: &str) -> Result<(String, u16, String)> {
     let parsed =
         url::Url::parse(url).map_err(|e| ProxyError::Proxy(format!("invalid URL '{url}': {e}")))?;
@@ -66,6 +84,7 @@ fn extract_host_port_path(url: &str) -> Result<(String, u16, String)> {
     Ok((host, port, path))
 }
 
+#[cfg(feature = "https-control-plane")]
 async fn resolve_target_addr(host: &str, port: u16) -> Result<std::net::SocketAddr> {
     if let Some(addr) = resolve_socket_addr(host, port) {
         return Ok(addr);
@@ -86,6 +105,7 @@ async fn resolve_target_addr(host: &str, port: u16) -> Result<std::net::SocketAd
         .ok_or_else(|| ProxyError::Proxy(format!("DNS returned no addresses for {host}:{port}")))
 }
 
+#[cfg(feature = "https-control-plane")]
 async fn connect_https_transport(
     host: &str,
     port: u16,
@@ -116,6 +136,7 @@ async fn connect_https_transport(
     Ok(UpstreamStream::Tcp(stream))
 }
 
+#[cfg(feature = "https-control-plane")]
 pub(crate) async fn https_get(
     url: &str,
     upstream: Option<Arc<UpstreamManager>>,
@@ -180,4 +201,15 @@ pub(crate) async fn https_get(
         date_header,
         body,
     })
+}
+
+#[cfg(not(feature = "https-control-plane"))]
+pub(crate) async fn https_get(
+    url: &str,
+    upstream: Option<Arc<UpstreamManager>>,
+) -> Result<HttpsGetResponse> {
+    let _ = upstream;
+    Err(ProxyError::Proxy(format!(
+        "HTTPS control-plane fetch is disabled in this build; use cached proxy-secret/proxy-config or enable the 'https-control-plane' feature for {url}"
+    )))
 }
