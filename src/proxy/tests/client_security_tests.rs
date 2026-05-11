@@ -181,7 +181,7 @@ async fn read_with_progress_fragmented_io_works_over_multiple_calls() {
 async fn read_with_progress_stress_randomized_chunk_sizes() {
     for i in 0..128 {
         let mut rng = StdRng::seed_from_u64(i as u64 + 1);
-        let mut input: Vec<u8> = (0..(i % 41)).map(|_| rng.next_u32() as u8).collect();
+        let input: Vec<u8> = (0..(i % 41)).map(|_| rng.next_u32() as u8).collect();
         let mut cursor = std::io::Cursor::new(input.clone());
         let mut collected = Vec::new();
 
@@ -197,6 +197,65 @@ async fn read_with_progress_stress_randomized_chunk_sizes() {
 
         assert_eq!(collected, input);
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn read_exact_progress_timeout_resets_after_each_chunk() {
+    let (mut server_side, mut client_side) = duplex(64);
+    let read_task = tokio::spawn(async move {
+        let mut buf = [0u8; 5];
+        read_exact_with_progress_timeout(
+            &mut server_side,
+            &mut buf,
+            Duration::from_secs(1),
+            "198.51.100.231:55001".parse().unwrap(),
+            "test_progress",
+        )
+        .await
+        .map(|()| buf)
+    });
+
+    let write_task = tokio::spawn(async move {
+        client_side.write_all(&[1, 2]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        client_side.write_all(&[3, 4]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        client_side.write_all(&[5]).await.unwrap();
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(700)).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(700)).await;
+    tokio::task::yield_now().await;
+
+    write_task.await.unwrap();
+    let got = read_task.await.unwrap().unwrap();
+    assert_eq!(got, [1, 2, 3, 4, 5]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn read_exact_progress_timeout_fires_without_progress() {
+    let (mut server_side, mut client_side) = duplex(64);
+    let read_task = tokio::spawn(async move {
+        let mut buf = [0u8; 5];
+        read_exact_with_progress_timeout(
+            &mut server_side,
+            &mut buf,
+            Duration::from_secs(1),
+            "198.51.100.232:55002".parse().unwrap(),
+            "test_stall",
+        )
+        .await
+    });
+
+    client_side.write_all(&[1]).await.unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+
+    let err = read_task.await.unwrap().unwrap_err();
+    assert!(matches!(err, ProxyError::TgHandshakeTimeout));
 }
 
 #[test]

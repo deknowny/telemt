@@ -27,7 +27,7 @@ const IDLE_REFRESH_TRIGGER_JITTER_SECS: u64 = 15;
 const IDLE_REFRESH_RETRY_SECS: u64 = 8;
 const IDLE_REFRESH_SUCCESS_GUARD_SECS: u64 = 1;
 const IDLE_REFRESH_MAX_PER_CYCLE: usize = 2;
-const HEALTH_RECONNECT_BUDGET_PER_CORE: usize = 2;
+const HEALTH_RECONNECT_BUDGET_PER_CORE: usize = 4;
 const HEALTH_RECONNECT_BUDGET_PER_DC: usize = 1;
 const HEALTH_RECONNECT_BUDGET_MIN: usize = 4;
 const HEALTH_RECONNECT_BUDGET_MAX: usize = 128;
@@ -39,6 +39,7 @@ const HEALTH_DRAIN_CLOSE_BUDGET_MIN: usize = 16;
 const HEALTH_DRAIN_CLOSE_BUDGET_MAX: usize = 256;
 const HEALTH_DRAIN_TIMEOUT_ENFORCER_INTERVAL_SECS: u64 = 1;
 const HEALTH_EXCESS_IDLE_DRAIN_BUDGET_PER_DC: usize = 2;
+const SINGLE_ENDPOINT_LOAD_TARGET_CAP: usize = 12;
 
 #[derive(Debug, Clone)]
 struct DcFloorPlanEntry {
@@ -79,6 +80,7 @@ struct FamilyReconnectOutcome {
     family: IpFamily,
     required: usize,
     endpoint_count: usize,
+    attempts: usize,
 }
 
 pub async fn me_health_monitor(pool: Arc<MePool>, rng: Arc<SecureRandom>, _min_connections: usize) {
@@ -473,7 +475,7 @@ async fn check_family(
             .map(|addr| *live_addr_counts.get(&(dc, *addr)).unwrap_or(&0))
             .sum::<usize>();
 
-        if endpoints.len() == 1 && pool.single_endpoint_outage_mode_enabled() && alive < required {
+        if endpoints.len() == 1 && pool.single_endpoint_outage_mode_enabled() && alive == 0 {
             family_degraded = true;
             if single_endpoint_outage.insert(key) {
                 pool.stats.increment_me_single_endpoint_outage_enter_total();
@@ -600,7 +602,8 @@ async fn check_family(
             .reconnect_runtime
             .me_reconnect_max_concurrent_per_dc
             .max(1) as usize;
-        if *inflight.get(&key).unwrap_or(&0) >= max_concurrent {
+        let already_inflight = *inflight.get(&key).unwrap_or(&0);
+        if already_inflight >= max_concurrent {
             continue;
         }
         if pool
@@ -617,52 +620,32 @@ async fn check_family(
             );
             continue;
         }
-        *inflight.entry(key).or_insert(0) += 1;
+        let attempts = missing
+            .min(max_concurrent.saturating_sub(already_inflight))
+            .min(reconnect_sem.available_permits())
+            .max(1);
+        *inflight.entry(key).or_insert(0) += attempts;
         let pool_for_reconnect = pool.clone();
         let rng_for_reconnect = rng.clone();
         let reconnect_sem_for_dc = reconnect_sem.clone();
         let endpoints_for_dc = endpoints.clone();
-        let live_writer_ids_by_addr_for_dc = live_writer_ids_by_addr.clone();
-        let writer_idle_since_for_dc = writer_idle_since.clone();
-        let bound_clients_by_writer_for_dc = bound_clients_by_writer.clone();
         let active_cap_effective_total = floor_plan.active_cap_effective_total;
         reconnect_set.spawn(async move {
-            let mut restored = 0usize;
-            for _ in 0..missing {
-                let Ok(reconnect_permit) = reconnect_sem_for_dc.clone().try_acquire_owned() else {
-                    break;
-                };
-                if pool_for_reconnect.active_contour_writer_count_total().await
-                    >= active_cap_effective_total
-                {
-                    let swapped = maybe_swap_idle_writer_for_cap(
-                        &pool_for_reconnect,
-                        &rng_for_reconnect,
-                        dc,
-                        family,
-                        &endpoints_for_dc,
-                        live_writer_ids_by_addr_for_dc.as_ref(),
-                        writer_idle_since_for_dc.as_ref(),
-                        bound_clients_by_writer_for_dc.as_ref(),
-                    )
-                    .await;
-                    if swapped {
-                        pool_for_reconnect
-                            .stats
-                            .increment_me_floor_swap_idle_total();
-                        restored += 1;
-                        continue;
-                    }
-
-                    let base_req = pool_for_reconnect
-                        .required_writers_for_dc_with_floor_mode(endpoints_for_dc.len(), false);
-                    if alive + restored >= base_req {
-                        pool_for_reconnect
-                            .stats
-                            .increment_me_floor_cap_block_total();
-                        pool_for_reconnect
-                            .stats
-                            .increment_me_floor_swap_idle_failed_total();
+            let mut attempt_set = JoinSet::<bool>::new();
+            for _ in 0..attempts {
+                let pool_for_attempt = pool_for_reconnect.clone();
+                let rng_for_attempt = rng_for_reconnect.clone();
+                let reconnect_sem_for_attempt = reconnect_sem_for_dc.clone();
+                let endpoints_for_attempt = endpoints_for_dc.clone();
+                attempt_set.spawn(async move {
+                    let Ok(_reconnect_permit) = reconnect_sem_for_attempt.try_acquire_owned()
+                    else {
+                        return false;
+                    };
+                    if pool_for_attempt.active_contour_writer_count_total().await
+                        >= active_cap_effective_total
+                    {
+                        pool_for_attempt.stats.increment_me_floor_cap_block_total();
                         debug!(
                             dc = %dc,
                             ?family,
@@ -671,33 +654,50 @@ async fn check_family(
                             active_cap_effective_total,
                             "Adaptive floor cap reached, reconnect attempt blocked"
                         );
-                        break;
+                        return false;
                     }
-                }
-                pool_for_reconnect.stats.increment_me_reconnect_attempt();
-                let res = tokio::time::timeout(
-                    pool_for_reconnect.reconnect_runtime.me_one_timeout,
-                    pool_for_reconnect.connect_endpoints_round_robin(
-                        dc,
-                        &endpoints_for_dc,
-                        rng_for_reconnect.as_ref(),
-                    ),
-                )
-                .await;
-                match res {
-                    Ok(true) => {
-                        restored += 1;
-                        pool_for_reconnect.stats.increment_me_reconnect_success();
+                    pool_for_attempt.stats.increment_me_reconnect_attempt();
+                    let res = tokio::time::timeout(
+                        pool_for_attempt.reconnect_runtime.me_one_timeout,
+                        pool_for_attempt.connect_endpoints_round_robin(
+                            dc,
+                            &endpoints_for_attempt,
+                            rng_for_attempt.as_ref(),
+                        ),
+                    )
+                    .await;
+                    match res {
+                        Ok(true) => {
+                            pool_for_attempt.stats.increment_me_reconnect_success();
+                            true
+                        }
+                        Ok(false) => {
+                            debug!(dc = %dc, ?family, "ME round-robin reconnect failed");
+                            false
+                        }
+                        Err(_) => {
+                            debug!(dc = %dc, ?family, "ME reconnect timed out");
+                            false
+                        }
                     }
-                    Ok(false) => {
-                        debug!(dc = %dc, ?family, "ME round-robin reconnect failed")
-                    }
-                    Err(_) => {
-                        debug!(dc = %dc, ?family, "ME reconnect timed out");
-                    }
-                }
-                drop(reconnect_permit);
+                });
             }
+
+            let mut restored = 0usize;
+            while let Some(joined) = attempt_set.join_next().await {
+                if matches!(joined, Ok(true)) {
+                    restored += 1;
+                }
+            }
+            debug!(
+                dc = %dc,
+                ?family,
+                attempts,
+                restored,
+                alive,
+                required,
+                "ME health reconnect batch finished"
+            );
 
             FamilyReconnectOutcome {
                 key,
@@ -705,6 +705,7 @@ async fn check_family(
                 family,
                 required,
                 endpoint_count: endpoints_for_dc.len(),
+                attempts,
             }
         });
     }
@@ -779,7 +780,7 @@ async fn check_family(
             }
         }
         if let Some(v) = inflight.get_mut(&outcome.key) {
-            *v = v.saturating_sub(1);
+            *v = v.saturating_sub(outcome.attempts);
         }
     }
 
@@ -933,7 +934,7 @@ fn adaptive_floor_class_max(
 }
 
 fn adaptive_floor_load_required(bound_clients: usize) -> usize {
-    const TARGET_CLIENTS_PER_WRITER: usize = 64;
+    const TARGET_CLIENTS_PER_WRITER: usize = 96;
 
     if bound_clients == 0 {
         0
@@ -1021,10 +1022,15 @@ async fn build_family_floor_plan(
         // Idle adaptive DCs keep quorum coverage instead of expanding to every
         // advertised endpoint. This prevents health checks from turning a large
         // Telegram proxy-config snapshot into an unbounded writer fanout.
+        let load_required = adaptive_floor_load_required(bound_clients);
         let desired_raw = if is_adaptive && !has_bound_clients {
             min_required
+        } else if is_adaptive && endpoints.len() == 1 {
+            base_required
+                .max(load_required)
+                .min(SINGLE_ENDPOINT_LOAD_TARGET_CAP.max(min_required))
         } else {
-            base_required.max(adaptive_floor_load_required(bound_clients))
+            base_required.max(load_required)
         };
         let mut target_required = desired_raw.clamp(min_required, max_required);
 
@@ -1215,92 +1221,6 @@ fn apply_adaptive_floor_target_hold(
     } else {
         target_required
     }
-}
-
-async fn maybe_swap_idle_writer_for_cap(
-    pool: &Arc<MePool>,
-    rng: &Arc<SecureRandom>,
-    dc: i32,
-    family: IpFamily,
-    endpoints: &[SocketAddr],
-    live_writer_ids_by_addr: &HashMap<(i32, SocketAddr), Vec<u64>>,
-    writer_idle_since: &HashMap<u64, u64>,
-    bound_clients_by_writer: &HashMap<u64, usize>,
-) -> bool {
-    let now_epoch_secs = MePool::now_epoch_secs();
-    let mut candidate: Option<(u64, SocketAddr, u64)> = None;
-    for endpoint in endpoints {
-        let Some(writer_ids) = live_writer_ids_by_addr.get(&(dc, *endpoint)) else {
-            continue;
-        };
-        for writer_id in writer_ids {
-            if bound_clients_by_writer.get(writer_id).copied().unwrap_or(0) > 0 {
-                continue;
-            }
-            let Some(idle_since_epoch_secs) = writer_idle_since.get(writer_id).copied() else {
-                continue;
-            };
-            let idle_age_secs = now_epoch_secs.saturating_sub(idle_since_epoch_secs);
-            if candidate
-                .as_ref()
-                .map(|(_, _, age)| idle_age_secs > *age)
-                .unwrap_or(true)
-            {
-                candidate = Some((*writer_id, *endpoint, idle_age_secs));
-            }
-        }
-    }
-
-    let Some((old_writer_id, endpoint, idle_age_secs)) = candidate else {
-        return false;
-    };
-
-    let connected = match tokio::time::timeout(
-        pool.reconnect_runtime.me_one_timeout,
-        pool.connect_one_for_dc(endpoint, dc, rng.as_ref()),
-    )
-    .await
-    {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            debug!(
-                dc = %dc,
-                ?family,
-                %endpoint,
-                old_writer_id,
-                idle_age_secs,
-                %error,
-                "Adaptive floor cap swap connect failed"
-            );
-            false
-        }
-        Err(_) => {
-            debug!(
-                dc = %dc,
-                ?family,
-                %endpoint,
-                old_writer_id,
-                idle_age_secs,
-                "Adaptive floor cap swap connect timed out"
-            );
-            false
-        }
-    };
-    if !connected {
-        return false;
-    }
-
-    pool.mark_writer_draining_with_timeout(old_writer_id, pool.force_close_timeout(), false)
-        .await;
-    info!(
-        dc = %dc,
-        ?family,
-        %endpoint,
-        old_writer_id,
-        idle_age_secs,
-        "Adaptive floor cap swap: idle writer rotated"
-    );
-    true
 }
 
 async fn drain_excess_idle_writers_for_dc(

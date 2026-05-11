@@ -779,7 +779,7 @@ impl MePool {
                 secret_atomic_snapshot: AtomicBool::new(me_secret_atomic_snapshot),
                 me_deterministic_writer_sort: AtomicBool::new(me_deterministic_writer_sort),
                 me_writer_pick_mode: AtomicU8::new(me_writer_pick_mode.as_u8()),
-                me_writer_pick_sample_size: AtomicU8::new(me_writer_pick_sample_size.clamp(2, 4)),
+                me_writer_pick_sample_size: AtomicU8::new(me_writer_pick_sample_size.clamp(2, 32)),
             }),
             transport_policy: Arc::new(TransportPolicyCore {
                 me_socks_kdf_policy: AtomicU8::new(me_socks_kdf_policy.as_u8()),
@@ -1120,7 +1120,7 @@ impl MePool {
             .store(writer_pick_mode.as_u8(), Ordering::Relaxed);
         self.writer_selection_policy
             .me_writer_pick_sample_size
-            .store(writer_pick_sample_size.clamp(2, 4), Ordering::Relaxed);
+            .store(writer_pick_sample_size.clamp(2, 32), Ordering::Relaxed);
         if previous_writer_pick_mode != writer_pick_mode {
             self.stats.increment_me_writer_pick_mode_switch_total();
         }
@@ -1413,7 +1413,7 @@ impl MePool {
         self.writer_selection_policy
             .me_writer_pick_sample_size
             .load(Ordering::Relaxed)
-            .clamp(2, 4) as usize
+            .clamp(2, 32) as usize
     }
 
     pub(super) fn required_writers_for_dc(&self, endpoint_count: usize) -> usize {
@@ -1518,10 +1518,11 @@ impl MePool {
     }
 
     // Keeps per-contour (active/warm) writer budget bounded by CPU count.
-    // Baseline is 86 writers on the first core and +48 for each extra core.
+    // The proxy is mostly network-bound, and a single ME writer becomes a
+    // latency bottleneck before CPU saturates under many client bindings.
     fn adaptive_floor_cpu_budget_per_contour_cap(&self, cores: usize) -> usize {
-        const FIRST_CORE_WRITER_BUDGET: usize = 86;
-        const EXTRA_CORE_WRITER_BUDGET: usize = 48;
+        const FIRST_CORE_WRITER_BUDGET: usize = 128;
+        const EXTRA_CORE_WRITER_BUDGET: usize = 96;
         if cores == 0 {
             return FIRST_CORE_WRITER_BUDGET;
         }

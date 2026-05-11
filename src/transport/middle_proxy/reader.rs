@@ -29,6 +29,12 @@ use super::{ConnRegistry, MeResponse};
 const DATA_ROUTE_MAX_ATTEMPTS: usize = 3;
 const DATA_ROUTE_QUEUE_FULL_STARVATION_THRESHOLD: u8 = 3;
 const FAIRNESS_DRAIN_BUDGET_PER_LOOP: usize = 128;
+const ME_RTT_DEGRADED_ENTER_ABS_MS: f64 = 1_200.0;
+const ME_RTT_DEGRADED_EXIT_ABS_MS: f64 = 650.0;
+const ME_RTT_DEGRADED_ENTER_DELTA_MS: f64 = 700.0;
+const ME_RTT_DEGRADED_EXIT_DELTA_MS: f64 = 300.0;
+const ME_RTT_DEGRADED_ENTER_RATIO: f64 = 4.0;
+const ME_RTT_DEGRADED_EXIT_RATIO: f64 = 2.0;
 
 fn should_close_on_route_result_for_data(result: RouteResult) -> bool {
     matches!(result, RouteResult::NoConn | RouteResult::ChannelClosed)
@@ -67,6 +73,22 @@ fn should_schedule_fairness_retry(snapshot: &WorkerFairnessSnapshot) -> bool {
 
 fn fairness_retry_delay(route_wait_ms: u64) -> Duration {
     Duration::from_millis(route_wait_ms.max(1))
+}
+
+fn me_rtt_degraded_now(previous: bool, baseline_ms: f64, ema_ms: f64) -> bool {
+    let baseline_ms = baseline_ms.max(1.0);
+    let enter_threshold = (baseline_ms * ME_RTT_DEGRADED_ENTER_RATIO)
+        .max(baseline_ms + ME_RTT_DEGRADED_ENTER_DELTA_MS)
+        .max(ME_RTT_DEGRADED_ENTER_ABS_MS);
+    let exit_threshold = (baseline_ms * ME_RTT_DEGRADED_EXIT_RATIO)
+        .max(baseline_ms + ME_RTT_DEGRADED_EXIT_DELTA_MS)
+        .max(ME_RTT_DEGRADED_EXIT_ABS_MS);
+
+    if previous {
+        ema_ms > exit_threshold
+    } else {
+        ema_ms > enter_threshold
+    }
 }
 
 async fn route_data_with_retry(
@@ -494,7 +516,8 @@ pub(crate) async fn reader_loop(
                         // allow slow baseline drift upward to avoid stale minimum
                         entry.0 = entry.0 * 0.99 + rtt * 0.01;
                     }
-                    let degraded_now = entry.1 > entry.0 * 2.0;
+                    let degraded_now =
+                        me_rtt_degraded_now(degraded.load(Ordering::Relaxed), entry.0, entry.1);
                     degraded.store(degraded_now, Ordering::Relaxed);
                     writer_rtt_ema_ms_x10.store(
                         (entry.1 * 10.0).clamp(0.0, u32::MAX as f64) as u32,
@@ -544,7 +567,7 @@ mod tests {
     use crate::transport::middle_proxy::ConnRegistry;
 
     use super::{
-        MeResponse, RouteResult, WorkerFairnessSnapshot, fairness_retry_delay,
+        MeResponse, RouteResult, WorkerFairnessSnapshot, fairness_retry_delay, me_rtt_degraded_now,
         is_data_route_queue_full, route_data_with_retry,
         should_close_on_queue_full_streak_with_policy, should_close_on_route_result_for_ack,
         should_close_on_route_result_for_data, should_schedule_fairness_retry,
@@ -615,6 +638,21 @@ mod tests {
     fn fairness_retry_delay_never_drops_below_one_millisecond() {
         assert_eq!(fairness_retry_delay(0), Duration::from_millis(1));
         assert_eq!(fairness_retry_delay(2), Duration::from_millis(2));
+    }
+
+    #[test]
+    fn me_rtt_degradation_ignores_normal_low_latency_jitter() {
+        assert!(!me_rtt_degraded_now(false, 45.0, 120.0));
+        assert!(!me_rtt_degraded_now(false, 90.0, 650.0));
+        assert!(me_rtt_degraded_now(false, 90.0, 1_250.0));
+    }
+
+    #[test]
+    fn me_rtt_degradation_uses_hysteresis_to_avoid_flapping() {
+        assert!(me_rtt_degraded_now(true, 90.0, 700.0));
+        assert!(!me_rtt_degraded_now(true, 90.0, 600.0));
+        assert!(!me_rtt_degraded_now(false, 250.0, 1_100.0));
+        assert!(me_rtt_degraded_now(false, 250.0, 1_300.0));
     }
 
     #[test]

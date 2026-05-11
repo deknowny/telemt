@@ -32,7 +32,8 @@ const HYBRID_RECOVERY_TRIGGER_MIN_INTERVAL_MS: u64 = 5_000;
 const PICK_PENALTY_WARM: u64 = 200;
 const PICK_PENALTY_DRAINING: u64 = 600;
 const PICK_PENALTY_STALE: u64 = 300;
-const PICK_PENALTY_DEGRADED: u64 = 250;
+const PICK_PENALTY_DEGRADED: u64 = 10_000;
+const PICK_RTT_PENALTY_MAX_MS: u64 = 30_000;
 
 impl MePool {
     /// Send RPC_PROXY_REQ. `tag_override`: per-user ad_tag (from access.user_ad_tags); if None, uses pool default.
@@ -962,7 +963,7 @@ impl MePool {
         let queue_penalty = queue_util_pct.saturating_mul(4);
         let rtt_penalty =
             ((writer.rtt_ema_ms_x10.load(Ordering::Relaxed) as u64).saturating_add(5) / 10)
-                .min(400);
+                .min(PICK_RTT_PENALTY_MAX_MS);
 
         contour_penalty
             .saturating_add(stale_penalty)

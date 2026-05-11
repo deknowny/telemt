@@ -1153,9 +1153,9 @@ impl ProxyConfig {
             ));
         }
 
-        if !(2..=4).contains(&config.general.me_writer_pick_sample_size) {
+        if !(2..=32).contains(&config.general.me_writer_pick_sample_size) {
             return Err(ProxyError::Config(
-                "general.me_writer_pick_sample_size must be within [2, 4]".to_string(),
+                "general.me_writer_pick_sample_size must be within [2, 32]".to_string(),
             ));
         }
 

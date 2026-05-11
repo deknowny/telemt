@@ -53,6 +53,7 @@ const STICKY_HINT_MAX_ENTRIES: usize = 65_536;
 const CANDIDATE_HINT_TRACK_CAP: usize = 64;
 const OVERLOAD_CANDIDATE_BUDGET_HINTED: usize = 16;
 const OVERLOAD_CANDIDATE_BUDGET_UNHINTED: usize = 8;
+const OVERLOAD_FULL_SCAN_USER_LIMIT: usize = 256;
 const EXPENSIVE_INVALID_SCAN_SATURATION_THRESHOLD: usize = 64;
 const RECENT_USER_RING_SCAN_LIMIT: usize = 32;
 
@@ -236,7 +237,7 @@ fn budget_for_validation(total_users: usize, overload: bool, has_hint: bool) -> 
     if total_users == 0 {
         return 0;
     }
-    if !overload {
+    if !overload || total_users <= OVERLOAD_FULL_SCAN_USER_LIMIT {
         return total_users;
     }
     let cap = if has_hint {

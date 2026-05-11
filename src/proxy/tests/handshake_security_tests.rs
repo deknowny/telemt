@@ -1195,7 +1195,7 @@ async fn tls_overload_budget_limits_candidate_scan_depth() {
     let mut config = ProxyConfig::default();
     config.access.users.clear();
     config.access.ignore_time_skew = true;
-    for idx in 0..32u8 {
+    for idx in 0..300u16 {
         config.access.users.insert(
             format!("user-{idx}"),
             format!("{:032x}", u128::from(idx) + 1),
@@ -1257,7 +1257,7 @@ async fn tls_expensive_invalid_scan_activates_saturation_budget() {
     let mut config = ProxyConfig::default();
     config.access.users.clear();
     config.access.ignore_time_skew = true;
-    for idx in 0..80u8 {
+    for idx in 0..300u16 {
         config.access.users.insert(
             format!("user-{idx}"),
             format!("{:032x}", u128::from(idx) + 1),
@@ -1298,7 +1298,7 @@ async fn tls_expensive_invalid_scan_activates_saturation_budget() {
             .handshake
             .auth_expensive_checks_total
             .load(Ordering::Relaxed),
-        80,
+        300,
         "first invalid probe preserves full first-hit compatibility before enabling saturation"
     );
 
@@ -1338,8 +1338,70 @@ async fn tls_expensive_invalid_scan_activates_saturation_budget() {
             .handshake
             .auth_expensive_checks_total
             .load(Ordering::Relaxed),
-        80 + OVERLOAD_CANDIDATE_BUDGET_UNHINTED as u64,
+        300 + OVERLOAD_CANDIDATE_BUDGET_UNHINTED as u64,
         "saturation budget must bound follow-up invalid scans"
+    );
+}
+
+#[tokio::test]
+async fn tls_overload_keeps_full_scan_for_small_runtime_user_sets() {
+    let mut config = ProxyConfig::default();
+    config.access.users.clear();
+    config.access.ignore_time_skew = true;
+    for idx in 0..80u16 {
+        config.access.users.insert(
+            format!("user-{idx}"),
+            format!("{:032x}", u128::from(idx) + 1),
+        );
+    }
+    config.rebuild_runtime_user_auth().unwrap();
+
+    let replay_checker = ReplayChecker::new(128, Duration::from_secs(60));
+    let rng = SecureRandom::new();
+    let shared = ProxySharedState::new();
+    let now = Instant::now();
+    {
+        let mut saturation = shared.handshake.auth_probe_saturation.lock().unwrap();
+        *saturation = Some(AuthProbeSaturationState {
+            fail_streak: AUTH_PROBE_BACKOFF_START_FAILS,
+            blocked_until: now + Duration::from_millis(200),
+            last_seen: now,
+        });
+    }
+
+    let peer: SocketAddr = "198.51.100.216:44326".parse().unwrap();
+    let attacker_secret = [0xEFu8; 16];
+    let handshake = make_valid_tls_handshake(&attacker_secret, 0);
+
+    let result = handle_tls_handshake_with_shared(
+        &handshake,
+        tokio::io::empty(),
+        tokio::io::sink(),
+        peer,
+        &config,
+        &replay_checker,
+        &rng,
+        None,
+        shared.as_ref(),
+    )
+    .await;
+
+    assert!(matches!(result, HandshakeResult::BadClient { .. }));
+    assert_eq!(
+        shared
+            .handshake
+            .auth_budget_exhausted_total
+            .load(Ordering::Relaxed),
+        0,
+        "small production user sets must not reject valid late candidates under overload"
+    );
+    assert_eq!(
+        shared
+            .handshake
+            .auth_expensive_checks_total
+            .load(Ordering::Relaxed),
+        80,
+        "small runtime user sets keep full compatibility even while saturation is active"
     );
 }
 

@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc};
 
 use super::codec::WriterCommand;
 use super::{MeResponse, RouteBytePermit};
@@ -74,35 +74,28 @@ struct WriterTable {
 #[derive(Clone)]
 struct HotConnBinding {
     writer_id: u64,
-    meta: ConnMeta,
 }
 
 struct HotBindingTable {
     map: DashMap<u64, HotConnBinding>,
 }
 
-struct BindingState {
-    inner: Mutex<BindingInner>,
+struct BindingTables {
+    writer_for_conn: DashMap<u64, u64>,
+    meta: DashMap<u64, ConnMeta>,
+    last_meta_for_writer: DashMap<u64, ConnMeta>,
+    writer_bound_count: DashMap<u64, Arc<AtomicUsize>>,
+    writer_idle_since_epoch_secs: DashMap<u64, u64>,
 }
 
-struct BindingInner {
-    writers: HashMap<u64, mpsc::Sender<WriterCommand>>,
-    writer_for_conn: HashMap<u64, u64>,
-    conns_for_writer: HashMap<u64, HashSet<u64>>,
-    meta: HashMap<u64, ConnMeta>,
-    last_meta_for_writer: HashMap<u64, ConnMeta>,
-    writer_idle_since_epoch_secs: HashMap<u64, u64>,
-}
-
-impl BindingInner {
+impl BindingTables {
     fn new() -> Self {
         Self {
-            writers: HashMap::new(),
-            writer_for_conn: HashMap::new(),
-            conns_for_writer: HashMap::new(),
-            meta: HashMap::new(),
-            last_meta_for_writer: HashMap::new(),
-            writer_idle_since_epoch_secs: HashMap::new(),
+            writer_for_conn: DashMap::new(),
+            meta: DashMap::new(),
+            last_meta_for_writer: DashMap::new(),
+            writer_bound_count: DashMap::new(),
+            writer_idle_since_epoch_secs: DashMap::new(),
         }
     }
 }
@@ -111,7 +104,7 @@ pub struct ConnRegistry {
     routing: RoutingTable,
     writers: WriterTable,
     hot_binding: HotBindingTable,
-    binding: BindingState,
+    binding: BindingTables,
     next_id: AtomicU64,
     route_channel_capacity: usize,
     route_backpressure_base_timeout_ms: AtomicU64,
@@ -153,9 +146,7 @@ impl ConnRegistry {
             hot_binding: HotBindingTable {
                 map: DashMap::new(),
             },
-            binding: BindingState {
-                inner: Mutex::new(BindingInner::new()),
-            },
+            binding: BindingTables::new(),
             next_id: AtomicU64::new(start),
             route_channel_capacity,
             route_backpressure_base_timeout_ms: AtomicU64::new(ROUTE_BACKPRESSURE_BASE_TIMEOUT_MS),
@@ -227,12 +218,10 @@ impl ConnRegistry {
     }
 
     pub async fn register_writer(&self, writer_id: u64, tx: mpsc::Sender<WriterCommand>) {
-        let mut binding = self.binding.inner.lock().await;
-        binding.writers.insert(writer_id, tx.clone());
-        binding
-            .conns_for_writer
+        self.binding
+            .writer_bound_count
             .entry(writer_id)
-            .or_insert_with(HashSet::new);
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)));
         self.writers.map.insert(writer_id, tx);
     }
 
@@ -241,23 +230,42 @@ impl ConnRegistry {
         self.routing.map.remove(&id);
         self.routing.byte_budget.remove(&id);
         self.hot_binding.map.remove(&id);
-        let mut binding = self.binding.inner.lock().await;
-        binding.meta.remove(&id);
-        if let Some(writer_id) = binding.writer_for_conn.remove(&id) {
-            let became_empty = if let Some(set) = binding.conns_for_writer.get_mut(&writer_id) {
-                set.remove(&id);
-                set.is_empty()
-            } else {
-                false
-            };
-            if became_empty {
-                binding
-                    .writer_idle_since_epoch_secs
-                    .insert(writer_id, Self::now_epoch_secs());
-            }
+        self.binding.meta.remove(&id);
+        if let Some((_, writer_id)) = self.binding.writer_for_conn.remove(&id) {
+            self.decrement_writer_bound_count(writer_id);
             return Some(writer_id);
         }
         None
+    }
+
+    fn increment_writer_bound_count(&self, writer_id: u64) {
+        let counter = self
+            .binding
+            .writer_bound_count
+            .entry(writer_id)
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .clone();
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.binding.writer_idle_since_epoch_secs.remove(&writer_id);
+    }
+
+    fn decrement_writer_bound_count(&self, writer_id: u64) {
+        let Some(counter) = self
+            .binding
+            .writer_bound_count
+            .get(&writer_id)
+            .map(|entry| entry.value().clone())
+        else {
+            return;
+        };
+        let previous = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_sub(1))
+        });
+        if matches!(previous, Ok(1)) {
+            self.binding
+                .writer_idle_since_epoch_secs
+                .insert(writer_id, Self::now_epoch_secs());
+        }
     }
 
     async fn attach_route_byte_permit(
@@ -459,48 +467,31 @@ impl ConnRegistry {
         writer_id: u64,
         meta: ConnMeta,
     ) -> BindWriterResult {
-        {
-            let mut binding = self.binding.inner.lock().await;
-            // ROUTING IS THE SOURCE OF TRUTH:
-            // never keep/attach writer binding for a connection that is already
-            // absent from the routing table.
-            if !self.routing.map.contains_key(&conn_id) {
-                return BindWriterResult::ConnMissing;
-            }
-            if !binding.writers.contains_key(&writer_id) {
-                return BindWriterResult::WriterMissing;
-            }
-
-            let previous_writer_id = binding.writer_for_conn.insert(conn_id, writer_id);
-            if let Some(previous_writer_id) = previous_writer_id
-                && previous_writer_id != writer_id
-            {
-                let became_empty =
-                    if let Some(set) = binding.conns_for_writer.get_mut(&previous_writer_id) {
-                        set.remove(&conn_id);
-                        set.is_empty()
-                    } else {
-                        false
-                    };
-                if became_empty {
-                    binding
-                        .writer_idle_since_epoch_secs
-                        .insert(previous_writer_id, Self::now_epoch_secs());
-                }
-            }
-
-            binding.meta.insert(conn_id, meta.clone());
-            binding.last_meta_for_writer.insert(writer_id, meta.clone());
-            binding.writer_idle_since_epoch_secs.remove(&writer_id);
-            binding
-                .conns_for_writer
-                .entry(writer_id)
-                .or_insert_with(HashSet::new)
-                .insert(conn_id);
+        // ROUTING IS THE SOURCE OF TRUTH:
+        // never keep/attach writer binding for a connection that is already
+        // absent from the routing table.
+        if !self.routing.map.contains_key(&conn_id) {
+            return BindWriterResult::ConnMissing;
         }
+        if !self.writers.map.contains_key(&writer_id) {
+            return BindWriterResult::WriterMissing;
+        }
+
+        let previous_writer_id = self.binding.writer_for_conn.insert(conn_id, writer_id);
+        if previous_writer_id != Some(writer_id) {
+            if let Some(previous_writer_id) = previous_writer_id {
+                self.decrement_writer_bound_count(previous_writer_id);
+            }
+            self.increment_writer_bound_count(writer_id);
+        }
+
+        self.binding.meta.insert(conn_id, meta.clone());
+        self.binding
+            .last_meta_for_writer
+            .insert(writer_id, meta.clone());
         self.hot_binding
             .map
-            .insert(conn_id, HotConnBinding { writer_id, meta });
+            .insert(conn_id, HotConnBinding { writer_id });
         BindWriterResult::Bound
     }
 
@@ -513,32 +504,40 @@ impl ConnRegistry {
     }
 
     pub async fn mark_writer_idle(&self, writer_id: u64) {
-        let mut binding = self.binding.inner.lock().await;
-        binding
-            .conns_for_writer
+        self.binding
+            .writer_bound_count
             .entry(writer_id)
-            .or_insert_with(HashSet::new);
-        binding
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)));
+        self.binding
             .writer_idle_since_epoch_secs
             .entry(writer_id)
             .or_insert(Self::now_epoch_secs());
     }
 
     pub async fn get_last_writer_meta(&self, writer_id: u64) -> Option<ConnMeta> {
-        let binding = self.binding.inner.lock().await;
-        binding.last_meta_for_writer.get(&writer_id).cloned()
+        self.binding
+            .last_meta_for_writer
+            .get(&writer_id)
+            .map(|entry| entry.value().clone())
     }
 
     pub async fn writer_idle_since_snapshot(&self) -> HashMap<u64, u64> {
-        let binding = self.binding.inner.lock().await;
-        binding.writer_idle_since_epoch_secs.clone()
+        self.binding
+            .writer_idle_since_epoch_secs
+            .iter()
+            .map(|entry| (*entry.key(), *entry.value()))
+            .collect()
     }
 
     pub async fn writer_idle_since_for_writer_ids(&self, writer_ids: &[u64]) -> HashMap<u64, u64> {
-        let binding = self.binding.inner.lock().await;
         let mut out = HashMap::<u64, u64>::with_capacity(writer_ids.len());
         for writer_id in writer_ids {
-            if let Some(idle_since) = binding.writer_idle_since_epoch_secs.get(writer_id).copied() {
+            if let Some(idle_since) = self
+                .binding
+                .writer_idle_since_epoch_secs
+                .get(writer_id)
+                .map(|entry| *entry.value())
+            {
                 out.insert(*writer_id, idle_since);
             }
         }
@@ -546,14 +545,14 @@ impl ConnRegistry {
     }
 
     pub(super) async fn writer_activity_snapshot(&self) -> WriterActivitySnapshot {
-        let binding = self.binding.inner.lock().await;
         let mut bound_clients_by_writer = HashMap::<u64, usize>::new();
         let mut active_sessions_by_target_dc = HashMap::<i16, usize>::new();
 
-        for (writer_id, conn_ids) in &binding.conns_for_writer {
-            bound_clients_by_writer.insert(*writer_id, conn_ids.len());
+        for entry in self.binding.writer_bound_count.iter() {
+            bound_clients_by_writer.insert(*entry.key(), entry.value().load(Ordering::Relaxed));
         }
-        for conn_meta in binding.meta.values() {
+        for conn_meta in self.binding.meta.iter() {
+            let conn_meta = conn_meta.value();
             if conn_meta.target_dc == 0 {
                 continue;
             }
@@ -590,93 +589,83 @@ impl ConnRegistry {
     }
 
     pub async fn active_conn_ids(&self) -> Vec<u64> {
-        let binding = self.binding.inner.lock().await;
-        binding.writer_for_conn.keys().copied().collect()
+        self.binding
+            .writer_for_conn
+            .iter()
+            .map(|entry| *entry.key())
+            .collect()
     }
 
     pub async fn writer_lost(&self, writer_id: u64) -> Vec<BoundConn> {
-        let (out, hot_binding_remove_ids) = {
-            let mut binding = self.binding.inner.lock().await;
-            binding.writers.remove(&writer_id);
-            binding.last_meta_for_writer.remove(&writer_id);
-            binding.writer_idle_since_epoch_secs.remove(&writer_id);
-            let conns = binding
-                .conns_for_writer
-                .remove(&writer_id)
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<Vec<_>>();
-
-            let mut out = Vec::new();
-            let mut hot_binding_remove_ids = Vec::new();
-            for conn_id in conns {
-                if binding.writer_for_conn.get(&conn_id).copied() != Some(writer_id) {
-                    continue;
-                }
-                binding.writer_for_conn.remove(&conn_id);
-                hot_binding_remove_ids.push(conn_id);
-                if let Some(m) = binding.meta.get(&conn_id) {
-                    out.push(BoundConn {
-                        conn_id,
-                        meta: m.clone(),
-                    });
-                }
-            }
-            (out, hot_binding_remove_ids)
-        };
-
         self.writers.map.remove(&writer_id);
-        for conn_id in hot_binding_remove_ids {
+        self.binding.last_meta_for_writer.remove(&writer_id);
+        self.binding.writer_idle_since_epoch_secs.remove(&writer_id);
+        self.binding.writer_bound_count.remove(&writer_id);
+
+        let conn_ids = self
+            .binding
+            .writer_for_conn
+            .iter()
+            .filter_map(|entry| (*entry.value() == writer_id).then_some(*entry.key()))
+            .collect::<Vec<_>>();
+
+        let mut out = Vec::new();
+        for conn_id in conn_ids {
+            if self
+                .binding
+                .writer_for_conn
+                .remove_if(&conn_id, |_, current_writer_id| {
+                    *current_writer_id == writer_id
+                })
+                .is_none()
+            {
+                continue;
+            }
             self.hot_binding
                 .map
                 .remove_if(&conn_id, |_, hot| hot.writer_id == writer_id);
+            if let Some((_, meta)) = self.binding.meta.remove(&conn_id) {
+                out.push(BoundConn { conn_id, meta });
+            }
         }
         out
     }
 
     #[allow(dead_code)]
     pub async fn get_meta(&self, conn_id: u64) -> Option<ConnMeta> {
-        self.hot_binding
-            .map
+        self.binding
+            .meta
             .get(&conn_id)
-            .map(|entry| entry.meta.clone())
+            .map(|entry| entry.value().clone())
     }
 
     pub async fn is_writer_empty(&self, writer_id: u64) -> bool {
-        let binding = self.binding.inner.lock().await;
-        binding
-            .conns_for_writer
+        self.binding
+            .writer_bound_count
             .get(&writer_id)
-            .map(|s| s.is_empty())
+            .map(|entry| entry.value().load(Ordering::Relaxed) == 0)
             .unwrap_or(true)
     }
 
     #[allow(dead_code)]
     pub async fn unregister_writer_if_empty(&self, writer_id: u64) -> bool {
-        let mut binding = self.binding.inner.lock().await;
-        let Some(conn_ids) = binding.conns_for_writer.get(&writer_id) else {
-            // Writer is already absent from the registry.
-            return true;
-        };
-        if !conn_ids.is_empty() {
+        if !self.is_writer_empty(writer_id).await {
             return false;
         }
 
-        binding.writers.remove(&writer_id);
         self.writers.map.remove(&writer_id);
-        binding.last_meta_for_writer.remove(&writer_id);
-        binding.writer_idle_since_epoch_secs.remove(&writer_id);
-        binding.conns_for_writer.remove(&writer_id);
+        self.binding.last_meta_for_writer.remove(&writer_id);
+        self.binding.writer_idle_since_epoch_secs.remove(&writer_id);
+        self.binding.writer_bound_count.remove(&writer_id);
         true
     }
 
     #[allow(dead_code)]
     pub(super) async fn non_empty_writer_ids(&self, writer_ids: &[u64]) -> HashSet<u64> {
-        let binding = self.binding.inner.lock().await;
         let mut out = HashSet::<u64>::with_capacity(writer_ids.len());
         for writer_id in writer_ids {
-            if let Some(conns) = binding.conns_for_writer.get(writer_id)
-                && !conns.is_empty()
+            if let Some(counter) = self.binding.writer_bound_count.get(writer_id)
+                && counter.value().load(Ordering::Relaxed) > 0
             {
                 out.insert(*writer_id);
             }

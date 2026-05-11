@@ -158,6 +158,7 @@ fn tls_clienthello_len_in_bounds(tls_len: usize) -> bool {
     (MIN_TLS_CLIENT_HELLO_SIZE..=MAX_TLS_PLAINTEXT_SIZE).contains(&tls_len)
 }
 
+#[cfg(test)]
 async fn read_with_progress<R: AsyncRead + Unpin>(
     reader: &mut R,
     mut buf: &mut [u8],
@@ -175,6 +176,59 @@ async fn read_with_progress<R: AsyncRead + Unpin>(
         }
     }
     Ok(total)
+}
+
+async fn read_with_progress_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    mut buf: &mut [u8],
+    progress_timeout: Duration,
+    peer: SocketAddr,
+    stage: &'static str,
+) -> Result<usize> {
+    let mut total = 0usize;
+    let expected = buf.len();
+    while !buf.is_empty() {
+        match timeout(progress_timeout, reader.read(buf)).await {
+            Ok(Ok(0)) => return Ok(total),
+            Ok(Ok(n)) => {
+                total += n;
+                let (_, rest) = buf.split_at_mut(n);
+                buf = rest;
+            }
+            Ok(Err(e)) => return Err(ProxyError::Io(e)),
+            Err(_) => {
+                debug!(
+                    peer = %peer,
+                    stage,
+                    got = total,
+                    expected,
+                    timeout_ms = progress_timeout.as_millis(),
+                    "Active handshake stalled without byte progress"
+                );
+                return Err(ProxyError::TgHandshakeTimeout);
+            }
+        }
+    }
+    Ok(total)
+}
+
+async fn read_exact_with_progress_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+    progress_timeout: Duration,
+    peer: SocketAddr,
+    stage: &'static str,
+) -> Result<()> {
+    let expected = buf.len();
+    let got = read_with_progress_timeout(reader, buf, progress_timeout, peer, stage).await?;
+    if got == expected {
+        return Ok(());
+    }
+
+    Err(ProxyError::Io(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        format!("expected {expected} bytes, got {got}"),
+    )))
 }
 
 async fn maybe_apply_mask_reject_delay(config: &ProxyConfig) {
@@ -202,6 +256,34 @@ fn handshake_timeout_with_mask_grace(config: &ProxyConfig) -> Duration {
     } else {
         base
     }
+}
+
+fn active_handshake_hard_timeout(progress_timeout: Duration) -> Duration {
+    const HARD_CAP: Duration = Duration::from_secs(300);
+    const MIN_EXTRA: Duration = Duration::from_secs(30);
+
+    progress_timeout
+        .saturating_mul(4)
+        .max(progress_timeout.saturating_add(MIN_EXTRA))
+        .min(HARD_CAP)
+}
+
+fn record_active_handshake_failure(
+    stats: &Stats,
+    beobachten: &BeobachtenStore,
+    config: &ProxyConfig,
+    peer_ip: IpAddr,
+    error: &ProxyError,
+) {
+    if matches!(error, ProxyError::TgHandshakeTimeout) {
+        stats.increment_handshake_timeouts();
+        stats.increment_handshake_failure_class("timeout");
+        record_beobachten_class(beobachten, config, peer_ip, "other");
+        return;
+    }
+
+    stats.increment_handshake_failure_class(classify_handshake_failure_class(error));
+    record_handshake_failure_class(beobachten, config, peer_ip, error);
 }
 
 fn effective_client_first_byte_idle_secs(config: &ProxyConfig, shared: &ProxySharedState) -> u64 {
@@ -563,20 +645,35 @@ where
         }
     };
 
-    let handshake_timeout = handshake_timeout_with_mask_grace(&config);
+    let handshake_progress_timeout = handshake_timeout_with_mask_grace(&config);
+    let handshake_hard_timeout = active_handshake_hard_timeout(handshake_progress_timeout);
     let stats_for_timeout = stats.clone();
     let config_for_timeout = config.clone();
     let beobachten_for_timeout = beobachten.clone();
     let peer_for_timeout = real_peer.ip();
 
     // Phase 2: active handshake (with timeout after the first client byte)
-    let outcome = match timeout(handshake_timeout, async {
+    let outcome = match timeout(handshake_hard_timeout, async {
         let mut first_bytes = [0u8; 5];
         if let Some(first_byte) = first_byte {
             first_bytes[0] = first_byte;
-            stream.read_exact(&mut first_bytes[1..]).await?;
+            read_exact_with_progress_timeout(
+                &mut stream,
+                &mut first_bytes[1..],
+                handshake_progress_timeout,
+                real_peer,
+                "record_header_tail",
+            )
+            .await?;
         } else {
-            stream.read_exact(&mut first_bytes).await?;
+            read_exact_with_progress_timeout(
+                &mut stream,
+                &mut first_bytes,
+                handshake_progress_timeout,
+                real_peer,
+                "record_header",
+            )
+            .await?;
         }
 
         let is_tls = tls::is_tls_handshake(&first_bytes[..3]);
@@ -611,9 +708,20 @@ where
 
             let mut handshake = vec![0u8; 5 + tls_len];
             handshake[..5].copy_from_slice(&first_bytes);
-            let body_read = match read_with_progress(&mut stream, &mut handshake[5..]).await {
+            let body_read = match read_with_progress_timeout(
+                &mut stream,
+                &mut handshake[5..],
+                handshake_progress_timeout,
+                real_peer,
+                "tls_clienthello_body",
+            )
+            .await
+            {
                 Ok(n) => n,
                 Err(e) => {
+                    if matches!(e, ProxyError::TgHandshakeTimeout) {
+                        return Err(e);
+                    }
                     debug!(peer = %real_peer, error = %e, tls_len = tls_len, "TLS ClientHello body read failed; engaging masking fallback");
                     stats.increment_connects_bad_with_class("tls_clienthello_read_error");
                     maybe_apply_mask_reject_delay(&config).await;
@@ -675,9 +783,15 @@ where
             };
 
             debug!(peer = %peer, "Reading MTProto handshake through TLS");
-            let mtproto_data = tls_reader.read_exact(HANDSHAKE_LEN).await?;
-            let mtproto_handshake: [u8; HANDSHAKE_LEN] = mtproto_data[..].try_into()
-                .map_err(|_| ProxyError::InvalidHandshake("Short MTProto handshake".into()))?;
+            let mut mtproto_handshake = [0u8; HANDSHAKE_LEN];
+            read_exact_with_progress_timeout(
+                &mut tls_reader,
+                &mut mtproto_handshake,
+                handshake_progress_timeout,
+                real_peer,
+                "tls_mtproto_handshake",
+            )
+            .await?;
 
             let (crypto_reader, crypto_writer, success) = match handle_mtproto_handshake_with_shared(
                 &mtproto_handshake, tls_reader, tls_writer, real_peer,
@@ -746,7 +860,14 @@ where
 
             let mut handshake = [0u8; HANDSHAKE_LEN];
             handshake[..5].copy_from_slice(&first_bytes);
-            stream.read_exact(&mut handshake[5..]).await?;
+            read_exact_with_progress_timeout(
+                &mut stream,
+                &mut handshake[5..],
+                handshake_progress_timeout,
+                real_peer,
+                "direct_mtproto_handshake",
+            )
+            .await?;
 
             let (read_half, write_half) = tokio::io::split(stream);
 
@@ -797,8 +918,8 @@ where
         Ok(Ok(outcome)) => outcome,
         Ok(Err(e)) => {
             debug!(peer = %peer, error = %e, "Handshake failed");
-            stats_for_timeout.increment_handshake_failure_class(classify_handshake_failure_class(&e));
-            record_handshake_failure_class(
+            record_active_handshake_failure(
+                stats_for_timeout.as_ref(),
                 &beobachten_for_timeout,
                 &config_for_timeout,
                 peer_for_timeout,
@@ -809,7 +930,11 @@ where
         Err(_) => {
             stats_for_timeout.increment_handshake_timeouts();
             stats_for_timeout.increment_handshake_failure_class("timeout");
-            debug!(peer = %peer, "Handshake timeout");
+            debug!(
+                peer = %peer,
+                timeout_ms = handshake_hard_timeout.as_millis(),
+                "Active handshake hard timeout"
+            );
             record_beobachten_class(
                 &beobachten_for_timeout,
                 &config_for_timeout,
@@ -1108,20 +1233,35 @@ impl RunningClientHandler {
             }
         };
 
-        let handshake_timeout = handshake_timeout_with_mask_grace(&self.config);
+        let handshake_progress_timeout = handshake_timeout_with_mask_grace(&self.config);
+        let handshake_hard_timeout = active_handshake_hard_timeout(handshake_progress_timeout);
         let stats = self.stats.clone();
         let config_for_timeout = self.config.clone();
         let beobachten_for_timeout = self.beobachten.clone();
         let peer_for_timeout = self.peer.ip();
         let peer_for_log = self.peer;
 
-        let outcome = match timeout(handshake_timeout, async {
+        let outcome = match timeout(handshake_hard_timeout, async {
             let mut first_bytes = [0u8; 5];
             if let Some(first_byte) = first_byte {
                 first_bytes[0] = first_byte;
-                self.stream.read_exact(&mut first_bytes[1..]).await?;
+                read_exact_with_progress_timeout(
+                    &mut self.stream,
+                    &mut first_bytes[1..],
+                    handshake_progress_timeout,
+                    self.peer,
+                    "record_header_tail",
+                )
+                .await?;
             } else {
-                self.stream.read_exact(&mut first_bytes).await?;
+                read_exact_with_progress_timeout(
+                    &mut self.stream,
+                    &mut first_bytes,
+                    handshake_progress_timeout,
+                    self.peer,
+                    "record_header",
+                )
+                .await?;
             }
 
             let is_tls = tls::is_tls_handshake(&first_bytes[..3]);
@@ -1140,8 +1280,8 @@ impl RunningClientHandler {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(e)) => {
                 debug!(peer = %peer_for_log, error = %e, "Handshake failed");
-                stats.increment_handshake_failure_class(classify_handshake_failure_class(&e));
-                record_handshake_failure_class(
+                record_active_handshake_failure(
+                    stats.as_ref(),
                     &beobachten_for_timeout,
                     &config_for_timeout,
                     peer_for_timeout,
@@ -1152,7 +1292,11 @@ impl RunningClientHandler {
             Err(_) => {
                 stats.increment_handshake_timeouts();
                 stats.increment_handshake_failure_class("timeout");
-                debug!(peer = %peer_for_log, "Handshake timeout");
+                debug!(
+                    peer = %peer_for_log,
+                    timeout_ms = handshake_hard_timeout.as_millis(),
+                    "Active handshake hard timeout"
+                );
                 record_beobachten_class(
                     &beobachten_for_timeout,
                     &config_for_timeout,
@@ -1204,9 +1348,21 @@ impl RunningClientHandler {
 
         let mut handshake = vec![0u8; 5 + tls_len];
         handshake[..5].copy_from_slice(&first_bytes);
-        let body_read = match read_with_progress(&mut self.stream, &mut handshake[5..]).await {
+        let handshake_progress_timeout = handshake_timeout_with_mask_grace(&self.config);
+        let body_read = match read_with_progress_timeout(
+            &mut self.stream,
+            &mut handshake[5..],
+            handshake_progress_timeout,
+            peer,
+            "tls_clienthello_body",
+        )
+        .await
+        {
             Ok(n) => n,
             Err(e) => {
+                if matches!(e, ProxyError::TgHandshakeTimeout) {
+                    return Err(e);
+                }
                 debug!(peer = %peer, error = %e, tls_len = tls_len, "TLS ClientHello body read failed; engaging masking fallback");
                 self.stats
                     .increment_connects_bad_with_class("tls_clienthello_read_error");
@@ -1282,10 +1438,15 @@ impl RunningClientHandler {
         };
 
         debug!(peer = %peer, "Reading MTProto handshake through TLS");
-        let mtproto_data = tls_reader.read_exact(HANDSHAKE_LEN).await?;
-        let mtproto_handshake: [u8; HANDSHAKE_LEN] = mtproto_data[..]
-            .try_into()
-            .map_err(|_| ProxyError::InvalidHandshake("Short MTProto handshake".into()))?;
+        let mut mtproto_handshake = [0u8; HANDSHAKE_LEN];
+        read_exact_with_progress_timeout(
+            &mut tls_reader,
+            &mut mtproto_handshake,
+            handshake_progress_timeout,
+            peer,
+            "tls_mtproto_handshake",
+        )
+        .await?;
 
         let (crypto_reader, crypto_writer, success) = match handle_mtproto_handshake_with_shared(
             &mtproto_handshake,
@@ -1381,7 +1542,15 @@ impl RunningClientHandler {
 
         let mut handshake = [0u8; HANDSHAKE_LEN];
         handshake[..5].copy_from_slice(&first_bytes);
-        self.stream.read_exact(&mut handshake[5..]).await?;
+        let handshake_progress_timeout = handshake_timeout_with_mask_grace(&self.config);
+        read_exact_with_progress_timeout(
+            &mut self.stream,
+            &mut handshake[5..],
+            handshake_progress_timeout,
+            peer,
+            "direct_mtproto_handshake",
+        )
+        .await?;
 
         let config = self.config.clone();
         let replay_checker = self.replay_checker.clone();
