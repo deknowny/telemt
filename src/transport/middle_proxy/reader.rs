@@ -31,6 +31,8 @@ const DATA_ROUTE_QUEUE_FULL_STARVATION_THRESHOLD: u8 = 3;
 const FAIRNESS_DRAIN_BUDGET_PER_LOOP: usize = 128;
 const ME_RTT_DEGRADED_ENTER_ABS_MS: f64 = 1_200.0;
 const ME_RTT_DEGRADED_EXIT_ABS_MS: f64 = 650.0;
+const ME_RTT_DEGRADED_ENTER_CAP_MS: f64 = 1_200.0;
+const ME_RTT_DEGRADED_EXIT_CAP_MS: f64 = 650.0;
 const ME_RTT_DEGRADED_ENTER_DELTA_MS: f64 = 700.0;
 const ME_RTT_DEGRADED_EXIT_DELTA_MS: f64 = 300.0;
 const ME_RTT_DEGRADED_ENTER_RATIO: f64 = 4.0;
@@ -79,10 +81,12 @@ fn me_rtt_degraded_now(previous: bool, baseline_ms: f64, ema_ms: f64) -> bool {
     let baseline_ms = baseline_ms.max(1.0);
     let enter_threshold = (baseline_ms * ME_RTT_DEGRADED_ENTER_RATIO)
         .max(baseline_ms + ME_RTT_DEGRADED_ENTER_DELTA_MS)
-        .max(ME_RTT_DEGRADED_ENTER_ABS_MS);
+        .max(ME_RTT_DEGRADED_ENTER_ABS_MS)
+        .min(ME_RTT_DEGRADED_ENTER_CAP_MS);
     let exit_threshold = (baseline_ms * ME_RTT_DEGRADED_EXIT_RATIO)
         .max(baseline_ms + ME_RTT_DEGRADED_EXIT_DELTA_MS)
-        .max(ME_RTT_DEGRADED_EXIT_ABS_MS);
+        .max(ME_RTT_DEGRADED_EXIT_ABS_MS)
+        .min(ME_RTT_DEGRADED_EXIT_CAP_MS);
 
     if previous {
         ema_ms > exit_threshold
@@ -567,8 +571,8 @@ mod tests {
     use crate::transport::middle_proxy::ConnRegistry;
 
     use super::{
-        MeResponse, RouteResult, WorkerFairnessSnapshot, fairness_retry_delay, me_rtt_degraded_now,
-        is_data_route_queue_full, route_data_with_retry,
+        MeResponse, RouteResult, WorkerFairnessSnapshot, fairness_retry_delay,
+        is_data_route_queue_full, me_rtt_degraded_now, route_data_with_retry,
         should_close_on_queue_full_streak_with_policy, should_close_on_route_result_for_ack,
         should_close_on_route_result_for_data, should_schedule_fairness_retry,
     };
@@ -653,6 +657,14 @@ mod tests {
         assert!(!me_rtt_degraded_now(true, 90.0, 600.0));
         assert!(!me_rtt_degraded_now(false, 250.0, 1_100.0));
         assert!(me_rtt_degraded_now(false, 250.0, 1_300.0));
+    }
+
+    #[test]
+    fn me_rtt_degradation_caps_drifted_baseline() {
+        assert!(me_rtt_degraded_now(false, 5_000.0, 1_300.0));
+        assert!(me_rtt_degraded_now(false, 5_000.0, 6_000.0));
+        assert!(me_rtt_degraded_now(true, 5_000.0, 700.0));
+        assert!(!me_rtt_degraded_now(true, 5_000.0, 600.0));
     }
 
     #[test]

@@ -83,6 +83,12 @@ struct FamilyReconnectOutcome {
     attempts: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WriterHealthSnapshot {
+    degraded: bool,
+    rtt_ema_ms_x10: u32,
+}
+
 pub async fn me_health_monitor(pool: Arc<MePool>, rng: Arc<SecureRandom>, _min_connections: usize) {
     let mut backoff: HashMap<(i32, IpFamily), u64> = HashMap::new();
     let mut next_attempt: HashMap<(i32, IpFamily), Instant> = HashMap::new();
@@ -405,7 +411,9 @@ async fn check_family(
     if pool.floor_mode() == MeFloorMode::Static {}
 
     let mut live_addr_counts = HashMap::<(i32, SocketAddr), usize>::new();
+    let mut live_healthy_addr_counts = HashMap::<(i32, SocketAddr), usize>::new();
     let mut live_writer_ids_by_addr = HashMap::<(i32, SocketAddr), Vec<u64>>::new();
+    let mut writer_health_by_id = HashMap::<u64, WriterHealthSnapshot>::new();
     for writer in pool
         .writers
         .read()
@@ -422,7 +430,20 @@ async fn check_family(
             continue;
         }
         let key = (writer.writer_dc, writer.addr);
+        let degraded = writer.degraded.load(std::sync::atomic::Ordering::Relaxed);
+        writer_health_by_id.insert(
+            writer.id,
+            WriterHealthSnapshot {
+                degraded,
+                rtt_ema_ms_x10: writer
+                    .rtt_ema_ms_x10
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
+        );
         *live_addr_counts.entry(key).or_insert(0) += 1;
+        if !degraded {
+            *live_healthy_addr_counts.entry(key).or_insert(0) += 1;
+        }
         live_writer_ids_by_addr
             .entry(key)
             .or_default()
@@ -454,6 +475,7 @@ async fn check_family(
         floor_plan.warm_writers_current,
     );
     let live_writer_ids_by_addr = Arc::new(live_writer_ids_by_addr);
+    let writer_health_by_id = Arc::new(writer_health_by_id);
     let writer_idle_since = Arc::new(writer_idle_since);
     let bound_clients_by_writer = Arc::new(bound_clients_by_writer);
     let mut reconnect_set = JoinSet::<FamilyReconnectOutcome>::new();
@@ -474,6 +496,16 @@ async fn check_family(
             .iter()
             .map(|addr| *live_addr_counts.get(&(dc, *addr)).unwrap_or(&0))
             .sum::<usize>();
+        let healthy_alive = endpoints
+            .iter()
+            .map(|addr| *live_healthy_addr_counts.get(&(dc, *addr)).unwrap_or(&0))
+            .sum::<usize>();
+        let degraded_alive = alive.saturating_sub(healthy_alive);
+        let floor_alive = if pool.drain_soft_evict_enabled() && degraded_alive > 0 {
+            healthy_alive
+        } else {
+            alive
+        };
 
         if endpoints.len() == 1 && pool.single_endpoint_outage_mode_enabled() && alive == 0 {
             family_degraded = true;
@@ -520,7 +552,26 @@ async fn check_family(
             );
         }
 
-        if alive > required {
+        if degraded_alive > 0 && healthy_alive >= required {
+            let drained = drain_degraded_writers_for_dc(
+                pool,
+                dc,
+                family,
+                &endpoints,
+                alive,
+                healthy_alive,
+                required,
+                live_writer_ids_by_addr.as_ref(),
+                bound_clients_by_writer.as_ref(),
+                writer_health_by_id.as_ref(),
+            )
+            .await;
+            if drained > 0 {
+                continue;
+            }
+        }
+
+        if alive > required && floor_alive >= required {
             let drained = drain_excess_idle_writers_for_dc(
                 pool,
                 dc,
@@ -538,7 +589,7 @@ async fn check_family(
             }
         }
 
-        if alive >= required {
+        if floor_alive >= required {
             maybe_refresh_idle_writer_for_dc(
                 pool,
                 rng,
@@ -570,7 +621,7 @@ async fn check_family(
             .await;
             continue;
         }
-        let missing = required - alive;
+        let missing = required - floor_alive;
         family_degraded = true;
 
         let now = Instant::now();
@@ -630,6 +681,7 @@ async fn check_family(
         let reconnect_sem_for_dc = reconnect_sem.clone();
         let endpoints_for_dc = endpoints.clone();
         let active_cap_effective_total = floor_plan.active_cap_effective_total;
+        let degraded_replacement_slack = degraded_alive;
         reconnect_set.spawn(async move {
             let mut attempt_set = JoinSet::<bool>::new();
             for _ in 0..attempts {
@@ -642,8 +694,11 @@ async fn check_family(
                     else {
                         return false;
                     };
-                    if pool_for_attempt.active_contour_writer_count_total().await
-                        >= active_cap_effective_total
+                    let active_count = pool_for_attempt.active_contour_writer_count_total().await;
+                    let active_cap_with_degraded_slack =
+                        active_cap_effective_total.saturating_add(degraded_replacement_slack);
+                    if degraded_replacement_slack == 0
+                        && active_count >= active_cap_with_degraded_slack
                     {
                         pool_for_attempt.stats.increment_me_floor_cap_block_total();
                         debug!(
@@ -652,6 +707,9 @@ async fn check_family(
                             alive,
                             required,
                             active_cap_effective_total,
+                            active_cap_with_degraded_slack,
+                            active_count,
+                            degraded_replacement_slack,
                             "Adaptive floor cap reached, reconnect attempt blocked"
                         );
                         return false;
@@ -1282,6 +1340,96 @@ async fn drain_excess_idle_writers_for_dc(
     drain_count
 }
 
+async fn drain_degraded_writers_for_dc(
+    pool: &Arc<MePool>,
+    dc: i32,
+    family: IpFamily,
+    endpoints: &[SocketAddr],
+    alive: usize,
+    healthy_alive: usize,
+    required: usize,
+    live_writer_ids_by_addr: &HashMap<(i32, SocketAddr), Vec<u64>>,
+    bound_clients_by_writer: &HashMap<u64, usize>,
+    writer_health_by_id: &HashMap<u64, WriterHealthSnapshot>,
+) -> usize {
+    if !pool.drain_soft_evict_enabled() || healthy_alive < required {
+        return 0;
+    }
+
+    let replacement_budget = alive.saturating_sub(required);
+    if replacement_budget == 0 {
+        return 0;
+    }
+
+    let mut candidates = Vec::<(u64, u32, usize)>::new();
+    for endpoint in endpoints {
+        let Some(writer_ids) = live_writer_ids_by_addr.get(&(dc, *endpoint)) else {
+            continue;
+        };
+        for writer_id in writer_ids {
+            let Some(health) = writer_health_by_id.get(writer_id).copied() else {
+                continue;
+            };
+            if !health.degraded {
+                continue;
+            }
+            candidates.push((
+                *writer_id,
+                health.rtt_ema_ms_x10,
+                bound_clients_by_writer.get(writer_id).copied().unwrap_or(0),
+            ));
+        }
+    }
+
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    let budget = pool
+        .drain_soft_evict_per_writer()
+        .min(
+            pool.drain_soft_evict_budget_per_core()
+                .saturating_mul(pool.adaptive_floor_effective_cpu_cores().max(1)),
+        )
+        .max(1);
+    let drain_count = candidates.len().min(replacement_budget).min(budget);
+    let grace_secs = pool.drain_soft_evict_grace_secs().max(1);
+
+    for (writer_id, _, _) in candidates.iter().take(drain_count) {
+        pool.mark_writer_draining_with_timeout(
+            *writer_id,
+            Some(Duration::from_secs(grace_secs)),
+            false,
+        )
+        .await;
+    }
+
+    info!(
+        dc = %dc,
+        ?family,
+        alive,
+        healthy_alive,
+        required,
+        degraded_alive = alive.saturating_sub(healthy_alive),
+        drained = drain_count,
+        grace_secs,
+        worst_rtt_ms = candidates
+            .first()
+            .map(|(_, rtt_x10, _)| *rtt_x10 as f64 / 10.0)
+            .unwrap_or(0.0),
+        "ME degraded writers soft-evicted after healthy replacements became available"
+    );
+    drain_count
+}
+
 async fn maybe_refresh_idle_writer_for_dc(
     pool: &Arc<MePool>,
     rng: &Arc<SecureRandom>,
@@ -1888,8 +2036,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        build_family_floor_plan, drain_excess_idle_writers_for_dc, idle_writer_pre_refresh_enabled,
-        reap_draining_writers,
+        WriterHealthSnapshot, build_family_floor_plan, drain_degraded_writers_for_dc,
+        drain_excess_idle_writers_for_dc, idle_writer_pre_refresh_enabled, reap_draining_writers,
     };
     use crate::config::{GeneralConfig, MeRouteNoWriterMode, MeSocksKdfPolicy, MeWriterPickMode};
     use crate::crypto::SecureRandom;
@@ -2047,6 +2195,16 @@ mod tests {
     }
 
     async fn insert_live_writer(pool: &Arc<MePool>, writer_id: u64, writer_dc: i32) {
+        insert_live_writer_with_health(pool, writer_id, writer_dc, false, 0).await;
+    }
+
+    async fn insert_live_writer_with_health(
+        pool: &Arc<MePool>,
+        writer_id: u64,
+        writer_dc: i32,
+        degraded: bool,
+        rtt_ema_ms_x10: u32,
+    ) {
         let (tx, _writer_rx) = mpsc::channel::<WriterCommand>(8);
         let writer = MeWriter {
             id: writer_id,
@@ -2066,8 +2224,8 @@ mod tests {
             created_at: Instant::now(),
             tx: tx.clone(),
             cancel: CancellationToken::new(),
-            degraded: Arc::new(AtomicBool::new(false)),
-            rtt_ema_ms_x10: Arc::new(AtomicU32::new(0)),
+            degraded: Arc::new(AtomicBool::new(degraded)),
+            rtt_ema_ms_x10: Arc::new(AtomicU32::new(rtt_ema_ms_x10)),
             draining: Arc::new(AtomicBool::new(false)),
             draining_started_at_epoch_secs: Arc::new(AtomicU64::new(0)),
             drain_deadline_epoch_secs: Arc::new(AtomicU64::new(0)),
@@ -2269,6 +2427,111 @@ mod tests {
             .filter(|writer| writer.draining.load(Ordering::Relaxed))
             .count();
         assert_eq!(draining, 2);
+    }
+
+    #[tokio::test]
+    async fn degraded_writer_soft_evict_waits_for_healthy_replacement_floor() {
+        let pool = make_pool(0).await;
+        insert_live_writer_with_health(&pool, 1, 2, false, 100).await;
+        insert_live_writer_with_health(&pool, 2, 2, true, 15_000).await;
+        insert_live_writer_with_health(&pool, 3, 2, true, 30_000).await;
+
+        let writers = pool.writers.read().await;
+        let endpoints = writers.iter().map(|writer| writer.addr).collect::<Vec<_>>();
+        let live_writer_ids_by_addr = writers
+            .iter()
+            .map(|writer| ((writer.writer_dc, writer.addr), vec![writer.id]))
+            .collect::<HashMap<_, _>>();
+        let writer_health_by_id = writers
+            .iter()
+            .map(|writer| {
+                (
+                    writer.id,
+                    WriterHealthSnapshot {
+                        degraded: writer.degraded.load(Ordering::Relaxed),
+                        rtt_ema_ms_x10: writer.rtt_ema_ms_x10.load(Ordering::Relaxed),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        drop(writers);
+        let bound_clients_by_writer = HashMap::from([(2u64, 32usize), (3u64, 64usize)]);
+
+        let drained = drain_degraded_writers_for_dc(
+            &pool,
+            2,
+            IpFamily::V4,
+            &endpoints,
+            3,
+            1,
+            2,
+            &live_writer_ids_by_addr,
+            &bound_clients_by_writer,
+            &writer_health_by_id,
+        )
+        .await;
+
+        assert_eq!(drained, 0);
+        assert!(
+            pool.writers
+                .read()
+                .await
+                .iter()
+                .all(|writer| !writer.draining.load(Ordering::Relaxed))
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_writer_soft_evict_drains_worst_after_healthy_replacement() {
+        let pool = make_pool(0).await;
+        insert_live_writer_with_health(&pool, 1, 2, false, 100).await;
+        insert_live_writer_with_health(&pool, 2, 2, false, 120).await;
+        insert_live_writer_with_health(&pool, 3, 2, true, 15_000).await;
+        insert_live_writer_with_health(&pool, 4, 2, true, 30_000).await;
+
+        let writers = pool.writers.read().await;
+        let endpoints = writers.iter().map(|writer| writer.addr).collect::<Vec<_>>();
+        let live_writer_ids_by_addr = writers
+            .iter()
+            .map(|writer| ((writer.writer_dc, writer.addr), vec![writer.id]))
+            .collect::<HashMap<_, _>>();
+        let writer_health_by_id = writers
+            .iter()
+            .map(|writer| {
+                (
+                    writer.id,
+                    WriterHealthSnapshot {
+                        degraded: writer.degraded.load(Ordering::Relaxed),
+                        rtt_ema_ms_x10: writer.rtt_ema_ms_x10.load(Ordering::Relaxed),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        drop(writers);
+        let bound_clients_by_writer = HashMap::from([(3u64, 16usize), (4u64, 64usize)]);
+
+        let drained = drain_degraded_writers_for_dc(
+            &pool,
+            2,
+            IpFamily::V4,
+            &endpoints,
+            4,
+            2,
+            1,
+            &live_writer_ids_by_addr,
+            &bound_clients_by_writer,
+            &writer_health_by_id,
+        )
+        .await;
+
+        assert_eq!(drained, 2);
+        let writers = pool.writers.read().await;
+        let draining_ids = writers
+            .iter()
+            .filter(|writer| writer.draining.load(Ordering::Relaxed))
+            .map(|writer| writer.id)
+            .collect::<Vec<_>>();
+        assert_eq!(draining_ids, vec![3, 4]);
     }
 
     #[tokio::test]
