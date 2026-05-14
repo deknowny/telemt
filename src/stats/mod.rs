@@ -270,6 +270,8 @@ pub struct Stats {
     me_writer_removed_unexpected_total: AtomicU64,
     me_writer_removed_reason_total: DashMap<&'static str, AtomicU64>,
     me_bind_commit_miss_total: DashMap<&'static str, AtomicU64>,
+    me_hot_path_total: DashMap<(i32, &'static str, &'static str), AtomicU64>,
+    me_hot_path_duration_ms: DashMap<(i32, &'static str, &'static str), AtomicU64>,
     me_refill_triggered_total: AtomicU64,
     me_refill_skipped_inflight_total: AtomicU64,
     me_refill_failed_total: AtomicU64,
@@ -1419,6 +1421,38 @@ impl Stats {
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
+    pub fn increment_me_hot_path_total(&self, dc: i32, stage: &'static str, result: &'static str) {
+        if self.telemetry_me_allows_normal() {
+            self.me_hot_path_total
+                .entry((dc, stage, result))
+                .or_insert_with(|| AtomicU64::new(0))
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn observe_me_hot_path_duration_ms(&self, dc: i32, stage: &'static str, duration_ms: u64) {
+        if !self.telemetry_me_allows_normal() {
+            return;
+        }
+        let bucket = match duration_ms {
+            0..=10 => "le_10",
+            11..=50 => "le_50",
+            51..=100 => "le_100",
+            101..=250 => "le_250",
+            251..=500 => "le_500",
+            501..=1_000 => "le_1000",
+            1_001..=2_500 => "le_2500",
+            2_501..=5_000 => "le_5000",
+            5_001..=8_000 => "le_8000",
+            8_001..=12_000 => "le_12000",
+            12_001..=20_000 => "le_20000",
+            20_001..=30_000 => "le_30000",
+            _ => "gt_30000",
+        };
+        self.me_hot_path_duration_ms
+            .entry((dc, stage, bucket))
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
     pub fn increment_me_refill_triggered_total(&self) {
         if self.telemetry_me_allows_debug() {
             self.me_refill_triggered_total
@@ -2324,6 +2358,30 @@ impl Stats {
             .map(|entry| (*entry.key(), entry.value().load(Ordering::Relaxed)))
             .collect::<Vec<_>>();
         values.sort_by_key(|(reason, _)| *reason);
+        values
+    }
+    pub fn get_me_hot_path_counts(&self) -> Vec<(i32, &'static str, &'static str, u64)> {
+        let mut values = self
+            .me_hot_path_total
+            .iter()
+            .map(|entry| {
+                let (dc, stage, result) = *entry.key();
+                (dc, stage, result, entry.value().load(Ordering::Relaxed))
+            })
+            .collect::<Vec<_>>();
+        values.sort_by_key(|(dc, stage, result, _)| (*dc, *stage, *result));
+        values
+    }
+    pub fn get_me_hot_path_duration_counts(&self) -> Vec<(i32, &'static str, &'static str, u64)> {
+        let mut values = self
+            .me_hot_path_duration_ms
+            .iter()
+            .map(|entry| {
+                let (dc, stage, bucket) = *entry.key();
+                (dc, stage, bucket, entry.value().load(Ordering::Relaxed))
+            })
+            .collect::<Vec<_>>();
+        values.sort_by_key(|(dc, stage, bucket, _)| (*dc, *stage, *bucket));
         values
     }
     pub fn get_me_refill_triggered_total(&self) -> u64 {

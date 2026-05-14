@@ -104,14 +104,34 @@ impl MePool {
                     .try_send(WriterCommand::Data(current_payload.clone()))
                 {
                     Ok(()) => {
+                        self.stats.increment_me_hot_path_total(
+                            routed_dc,
+                            "bound_writer_send",
+                            "success",
+                        );
                         self.note_hybrid_route_success();
                         return Ok(());
                     }
                     Err(TrySendError::Full(cmd)) => {
+                        self.stats.increment_me_hot_path_total(
+                            routed_dc,
+                            "bound_writer_send",
+                            "full",
+                        );
                         if current.tx.send(cmd).await.is_ok() {
+                            self.stats.increment_me_hot_path_total(
+                                routed_dc,
+                                "bound_writer_send_blocking",
+                                "success",
+                            );
                             self.note_hybrid_route_success();
                             return Ok(());
                         }
+                        self.stats.increment_me_hot_path_total(
+                            routed_dc,
+                            "bound_writer_send_blocking",
+                            "closed",
+                        );
                         if self
                             .remove_writer_and_close_clients_with_reason(
                                 current.writer_id,
@@ -129,6 +149,11 @@ impl MePool {
                         continue;
                     }
                     Err(TrySendError::Closed(_)) => {
+                        self.stats.increment_me_hot_path_total(
+                            routed_dc,
+                            "bound_writer_send",
+                            "closed",
+                        );
                         if self
                             .remove_writer_and_close_clients_with_reason(
                                 current.writer_id,
@@ -278,6 +303,11 @@ impl MePool {
                         }
                         self.stats
                             .increment_me_writer_pick_no_candidate_total(pick_mode);
+                        self.stats.increment_me_hot_path_total(
+                            routed_dc,
+                            "candidate_lookup",
+                            "none",
+                        );
                         self.stats.increment_me_no_writer_failfast_total();
                         return Err(ProxyError::Proxy(
                             "No ME writers available for target DC in failfast window".into(),
@@ -294,6 +324,11 @@ impl MePool {
                             }
                             self.stats
                                 .increment_me_writer_pick_no_candidate_total(pick_mode);
+                            self.stats.increment_me_hot_path_total(
+                                routed_dc,
+                                "candidate_lookup",
+                                "none_unknown_dc",
+                            );
                             self.stats.increment_me_no_writer_failfast_total();
                             return Err(ProxyError::Proxy(
                                 "No ME writers available for target DC".into(),
@@ -304,6 +339,11 @@ impl MePool {
                         {
                             self.stats
                                 .increment_me_writer_pick_no_candidate_total(pick_mode);
+                            self.stats.increment_me_hot_path_total(
+                                routed_dc,
+                                "candidate_lookup",
+                                "none_after_recovery_budget",
+                            );
                             self.stats.increment_me_no_writer_failfast_total();
                             return Err(ProxyError::Proxy(
                                 "No ME writers available for target DC".into(),
@@ -337,6 +377,11 @@ impl MePool {
                         if candidate_indices.is_empty() {
                             self.stats
                                 .increment_me_writer_pick_no_candidate_total(pick_mode);
+                            self.stats.increment_me_hot_path_total(
+                                routed_dc,
+                                "candidate_lookup",
+                                "none_after_inline_recovery",
+                            );
                             return Err(ProxyError::Proxy(
                                 "No ME writers available for target DC".into(),
                             ));
@@ -475,6 +520,11 @@ impl MePool {
                                 );
                                 self.stats
                                     .increment_me_bind_commit_miss_total("conn_missing");
+                                self.stats.increment_me_hot_path_total(
+                                    routed_dc,
+                                    "bind_commit",
+                                    "conn_missing",
+                                );
                                 drop(permit);
                                 return Err(ProxyError::Proxy(
                                     "Client connection closed before ME bind".into(),
@@ -488,13 +538,29 @@ impl MePool {
                                 );
                                 self.stats
                                     .increment_me_bind_commit_miss_total("writer_missing");
+                                self.stats.increment_me_hot_path_total(
+                                    routed_dc,
+                                    "bind_commit",
+                                    "writer_missing",
+                                );
                                 drop(permit);
+                                let _ = self
+                                    .remove_writer_and_close_clients_with_reason(
+                                        w.id,
+                                        "candidate_bind_writer_missing",
+                                    )
+                                    .await;
                                 continue;
                             }
                         }
                         permit.send(WriterCommand::Data(payload.clone()));
                         self.stats
                             .increment_me_writer_pick_success_try_total(pick_mode);
+                        self.stats.increment_me_hot_path_total(
+                            routed_dc,
+                            "candidate_try_reserve",
+                            "success",
+                        );
                         if w.generation < self.current_generation() {
                             self.stats.increment_pool_stale_pick_total();
                             debug!(
@@ -509,12 +575,22 @@ impl MePool {
                         return Ok(());
                     }
                     Err(TrySendError::Full(_)) => {
+                        self.stats.increment_me_hot_path_total(
+                            routed_dc,
+                            "candidate_try_reserve",
+                            "full",
+                        );
                         if fallback_blocking_idx.is_none() {
                             fallback_blocking_idx = Some(idx);
                         }
                     }
                     Err(TrySendError::Closed(_)) => {
                         self.stats.increment_me_writer_pick_closed_total(pick_mode);
+                        self.stats.increment_me_hot_path_total(
+                            routed_dc,
+                            "candidate_try_reserve",
+                            "closed",
+                        );
                         if self
                             .remove_writer_and_close_clients_with_reason(
                                 w.id,
@@ -533,12 +609,22 @@ impl MePool {
 
             let Some(blocking_idx) = fallback_blocking_idx else {
                 self.stats.increment_me_writer_pick_full_total(pick_mode);
+                self.stats.increment_me_hot_path_total(
+                    routed_dc,
+                    "candidate_try_reserve",
+                    "all_full",
+                );
                 continue;
             };
 
             let w = writers_snapshot[blocking_idx].clone();
             if !self.writer_accepts_new_binding(&w) {
                 self.stats.increment_me_writer_pick_full_total(pick_mode);
+                self.stats.increment_me_hot_path_total(
+                    routed_dc,
+                    "fallback_reserve",
+                    "not_accepting",
+                );
                 continue;
             }
             self.stats
@@ -551,6 +637,11 @@ impl MePool {
                         Ok(result) => result,
                         Err(_) => {
                             self.stats.increment_me_writer_pick_full_total(pick_mode);
+                            self.stats.increment_me_hot_path_total(
+                                routed_dc,
+                                "fallback_reserve",
+                                "timeout",
+                            );
                             continue;
                         }
                     }
@@ -569,6 +660,11 @@ impl MePool {
                             );
                             self.stats
                                 .increment_me_bind_commit_miss_total("fallback_conn_missing");
+                            self.stats.increment_me_hot_path_total(
+                                routed_dc,
+                                "fallback_bind_commit",
+                                "conn_missing",
+                            );
                             drop(permit);
                             return Err(ProxyError::Proxy(
                                 "Client connection closed before ME fallback bind".into(),
@@ -582,13 +678,29 @@ impl MePool {
                             );
                             self.stats
                                 .increment_me_bind_commit_miss_total("fallback_writer_missing");
+                            self.stats.increment_me_hot_path_total(
+                                routed_dc,
+                                "fallback_bind_commit",
+                                "writer_missing",
+                            );
                             drop(permit);
+                            let _ = self
+                                .remove_writer_and_close_clients_with_reason(
+                                    w.id,
+                                    "fallback_bind_writer_missing",
+                                )
+                                .await;
                             continue;
                         }
                     }
                     permit.send(WriterCommand::Data(payload.clone()));
                     self.stats
                         .increment_me_writer_pick_success_fallback_total(pick_mode);
+                    self.stats.increment_me_hot_path_total(
+                        routed_dc,
+                        "fallback_reserve",
+                        "success",
+                    );
                     if w.generation < self.current_generation() {
                         self.stats.increment_pool_stale_pick_total();
                     }
@@ -597,6 +709,8 @@ impl MePool {
                 }
                 Err(_) => {
                     self.stats.increment_me_writer_pick_closed_total(pick_mode);
+                    self.stats
+                        .increment_me_hot_path_total(routed_dc, "fallback_reserve", "closed");
                     if self
                         .remove_writer_and_close_clients_with_reason(
                             w.id,

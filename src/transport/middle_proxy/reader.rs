@@ -138,7 +138,20 @@ fn route_feedback(result: RouteResult) -> DispatchFeedback {
     }
 }
 
-fn report_route_drop(result: RouteResult, stats: &Stats) {
+fn route_result_label(result: RouteResult) -> &'static str {
+    match result {
+        RouteResult::Routed => "routed",
+        RouteResult::NoConn => "no_conn",
+        RouteResult::ChannelClosed => "channel_closed",
+        RouteResult::QueueFullBase => "queue_full_base",
+        RouteResult::QueueFullHigh => "queue_full_high",
+    }
+}
+
+fn report_route_drop(result: RouteResult, stats: &Stats, dc: Option<i32>, stage: &'static str) {
+    if let Some(dc) = dc {
+        stats.increment_me_hot_path_total(dc, stage, route_result_label(result));
+    }
     match result {
         RouteResult::NoConn => stats.increment_me_route_drop_no_conn(),
         RouteResult::ChannelClosed => stats.increment_me_route_drop_channel_closed(),
@@ -205,6 +218,7 @@ async fn drain_fairness_scheduler(
             break;
         };
         let cid = candidate.frame.conn_id;
+        let target_dc = reg.get_meta(cid).await.map(|meta| meta.target_dc as i32);
         let pressure_state = candidate.pressure_state;
         let _flow_class = candidate.flow_class;
         let routed = route_data_with_retry(
@@ -216,9 +230,12 @@ async fn drain_fairness_scheduler(
         )
         .await;
         if matches!(routed, RouteResult::Routed) {
+            if let Some(dc) = target_dc {
+                stats.increment_me_hot_path_total(dc, "route_data_fairness", "routed");
+            }
             data_route_queue_full_streak.remove(&cid);
         } else {
-            report_route_drop(routed, stats);
+            report_route_drop(routed, stats, target_dc, "route_data_fairness");
         }
         let action = fairness.apply_dispatch_feedback(cid, candidate, route_feedback(routed), now);
         if is_data_route_queue_full(routed) {
@@ -393,10 +410,29 @@ pub(crate) async fn reader_loop(
                 let cid = u64::from_le_bytes(body[4..12].try_into().unwrap());
                 let data = body.slice(12..);
                 trace!(cid, flags, len = data.len(), "RPC_PROXY_ANS");
+                let target_dc = reg.get_meta(cid).await.map(|meta| meta.target_dc as i32);
+                if let Some((dc, elapsed_ms)) = reg.first_response_elapsed_ms(cid).await {
+                    stats.observe_me_hot_path_duration_ms(dc, "first_response", elapsed_ms);
+                    stats.increment_me_hot_path_total(dc, "first_response", "observed");
+                }
 
                 if fairshare_enabled {
                     let admission = fairness.enqueue_data(cid, flags, data, Instant::now());
                     if !matches!(admission, AdmissionDecision::Admit) {
+                        if let Some(dc) = target_dc {
+                            stats.increment_me_hot_path_total(
+                                dc,
+                                "route_data_admission",
+                                match admission {
+                                    AdmissionDecision::Admit => "admit",
+                                    AdmissionDecision::RejectWorkerCap => "reject_worker_cap",
+                                    AdmissionDecision::RejectFlowCap => "reject_flow_cap",
+                                    AdmissionDecision::RejectBucketCap => "reject_bucket_cap",
+                                    AdmissionDecision::RejectSaturated => "reject_saturated",
+                                    AdmissionDecision::RejectStandingFlow => "reject_standing_flow",
+                                },
+                            );
+                        }
                         stats.increment_me_route_drop_queue_full();
                         stats.increment_me_route_drop_queue_full_high();
                         let streak = data_route_queue_full_streak.entry(cid).or_insert(0);
@@ -420,10 +456,13 @@ pub(crate) async fn reader_loop(
                     let routed =
                         route_data_with_retry(reg.as_ref(), cid, flags, data, route_wait_ms).await;
                     if matches!(routed, RouteResult::Routed) {
+                        if let Some(dc) = target_dc {
+                            stats.increment_me_hot_path_total(dc, "route_data", "routed");
+                        }
                         data_route_queue_full_streak.remove(&cid);
                         continue;
                     }
-                    report_route_drop(routed, stats.as_ref());
+                    report_route_drop(routed, stats.as_ref(), target_dc, "route_data");
                     if should_close_on_route_result_for_data(routed) {
                         fairness.remove_flow(cid);
                         data_route_queue_full_streak.remove(&cid);
@@ -451,23 +490,14 @@ pub(crate) async fn reader_loop(
                 let cfm = u32::from_le_bytes(body[8..12].try_into().unwrap());
                 trace!(cid, cfm, "RPC_SIMPLE_ACK");
 
+                let target_dc = reg.get_meta(cid).await.map(|meta| meta.target_dc as i32);
+                if let Some((dc, elapsed_ms)) = reg.first_response_elapsed_ms(cid).await {
+                    stats.observe_me_hot_path_duration_ms(dc, "first_response", elapsed_ms);
+                    stats.increment_me_hot_path_total(dc, "first_response", "observed_ack");
+                }
                 let routed = reg.route_nowait(cid, MeResponse::Ack(cfm)).await;
                 if !matches!(routed, RouteResult::Routed) {
-                    match routed {
-                        RouteResult::NoConn => stats.increment_me_route_drop_no_conn(),
-                        RouteResult::ChannelClosed => {
-                            stats.increment_me_route_drop_channel_closed()
-                        }
-                        RouteResult::QueueFullBase => {
-                            stats.increment_me_route_drop_queue_full();
-                            stats.increment_me_route_drop_queue_full_base();
-                        }
-                        RouteResult::QueueFullHigh => {
-                            stats.increment_me_route_drop_queue_full();
-                            stats.increment_me_route_drop_queue_full_high();
-                        }
-                        RouteResult::Routed => {}
-                    }
+                    report_route_drop(routed, stats.as_ref(), target_dc, "route_ack");
                     if should_close_on_route_result_for_ack(routed) {
                         reg.unregister(cid).await;
                         send_close_conn(&tx, cid).await;

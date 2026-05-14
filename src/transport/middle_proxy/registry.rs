@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use tokio::sync::mpsc::error::TrySendError;
@@ -83,6 +83,7 @@ struct HotBindingTable {
 struct BindingTables {
     writer_for_conn: DashMap<u64, u64>,
     meta: DashMap<u64, ConnMeta>,
+    first_response_started_at: DashMap<u64, Instant>,
     last_meta_for_writer: DashMap<u64, ConnMeta>,
     writer_bound_count: DashMap<u64, Arc<AtomicUsize>>,
     writer_idle_since_epoch_secs: DashMap<u64, u64>,
@@ -93,6 +94,7 @@ impl BindingTables {
         Self {
             writer_for_conn: DashMap::new(),
             meta: DashMap::new(),
+            first_response_started_at: DashMap::new(),
             last_meta_for_writer: DashMap::new(),
             writer_bound_count: DashMap::new(),
             writer_idle_since_epoch_secs: DashMap::new(),
@@ -231,6 +233,7 @@ impl ConnRegistry {
         self.routing.byte_budget.remove(&id);
         self.hot_binding.map.remove(&id);
         self.binding.meta.remove(&id);
+        self.binding.first_response_started_at.remove(&id);
         if let Some((_, writer_id)) = self.binding.writer_for_conn.remove(&id) {
             self.decrement_writer_bound_count(writer_id);
             return Some(writer_id);
@@ -487,6 +490,9 @@ impl ConnRegistry {
 
         self.binding.meta.insert(conn_id, meta.clone());
         self.binding
+            .first_response_started_at
+            .insert(conn_id, Instant::now());
+        self.binding
             .last_meta_for_writer
             .insert(writer_id, meta.clone());
         self.hot_binding
@@ -625,6 +631,7 @@ impl ConnRegistry {
                 .map
                 .remove_if(&conn_id, |_, hot| hot.writer_id == writer_id);
             if let Some((_, meta)) = self.binding.meta.remove(&conn_id) {
+                self.binding.first_response_started_at.remove(&conn_id);
                 out.push(BoundConn { conn_id, meta });
             }
         }
@@ -637,6 +644,17 @@ impl ConnRegistry {
             .meta
             .get(&conn_id)
             .map(|entry| entry.value().clone())
+    }
+
+    pub async fn first_response_elapsed_ms(&self, conn_id: u64) -> Option<(i32, u64)> {
+        let (_, started_at) = self.binding.first_response_started_at.remove(&conn_id)?;
+        let dc = self
+            .binding
+            .meta
+            .get(&conn_id)
+            .map(|entry| entry.value().target_dc as i32)?;
+        let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        Some((dc, elapsed_ms))
     }
 
     pub async fn is_writer_empty(&self, writer_id: u64) -> bool {

@@ -3016,6 +3016,36 @@ async fn render_metrics(
 
     let _ = writeln!(
         out,
+        "# HELP telemt_me_hot_path_total ME hot-path events by target DC, stage and result"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_hot_path_total counter");
+    if me_allows_normal {
+        for (dc, stage, result, count) in stats.get_me_hot_path_counts() {
+            let _ = writeln!(
+                out,
+                "telemt_me_hot_path_total{{dc=\"{}\",stage=\"{}\",result=\"{}\"}} {}",
+                dc, stage, result, count
+            );
+        }
+    }
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_hot_path_duration_ms_bucket ME hot-path duration buckets by target DC and stage"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_hot_path_duration_ms_bucket counter");
+    if me_allows_normal {
+        for (dc, stage, bucket, count) in stats.get_me_hot_path_duration_counts() {
+            let _ = writeln!(
+                out,
+                "telemt_me_hot_path_duration_ms_bucket{{dc=\"{}\",stage=\"{}\",bucket=\"{}\"}} {}",
+                dc, stage, bucket, count
+            );
+        }
+    }
+
+    let _ = writeln!(
+        out,
         "# HELP telemt_me_refill_triggered_total Immediate ME refill runs started"
     );
     let _ = writeln!(out, "# TYPE telemt_me_refill_triggered_total counter");
